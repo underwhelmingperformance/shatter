@@ -13,9 +13,12 @@ const WORKGROUP_SIZE_X: u32 = 8;
 const WORKGROUP_SIZE_Y: u32 = 8;
 
 // Algorithm note:
-// This shader follows the random-cell reveal style seen in gl-transitions
-// (e.g. random-squares), then adds shard displacement so cells appear to break
-// outward while revealing the target image.
+// This shader simulates an explosion behind the image plane. All cell-sized
+// debris flies forward towards the camera, scaling up via perspective projection.
+// Cells further from centre drift off-screen faster (parallax), while centre
+// cells loom large before fading. Edges crack first, the centre holds longest.
+// Once the source image has fully dispersed, the process reverses to assemble
+// the target image.
 const SHATTER_SHADER: &str = r#"
 struct Params {
     out_width: u32,
@@ -47,9 +50,9 @@ var<storage, read_write> out_pixels: array<u32>;
 @group(0) @binding(3)
 var<uniform> params: Params;
 
-const GRID_X: f32 = 28.0;
-const GRID_Y: f32 = 28.0;
-const SMOOTHNESS: f32 = 0.09;
+const GRID_X: f32 = 20.0;
+const GRID_Y: f32 = 20.0;
+const SMOOTHNESS: f32 = 0.08;
 
 fn unpack_rgba(pixel: u32) -> vec4<f32> {
     let r = f32(pixel & 0xFFu) / 255.0;
@@ -75,10 +78,8 @@ fn hash01_u32(x: u32, y: u32, seed_lo: u32, seed_hi: u32) -> f32 {
     return f32(state & 0x00FFFFFFu) / 16777215.0;
 }
 
-fn hash01_vec2(v: vec2<f32>, seed_lo: u32, seed_hi: u32) -> f32 {
-    let x = u32(v.x);
-    let y = u32(v.y);
-    return hash01_u32(x, y, seed_lo, seed_hi);
+fn hash_channel(cx: u32, cy: u32, ch: u32, seed_lo: u32, seed_hi: u32) -> f32 {
+    return hash01_u32(cx + ch * 7919u, cy + ch * 6271u, seed_lo, seed_hi);
 }
 
 fn cell_progress(cell_noise: f32, phase_progress: f32) -> f32 {
@@ -87,13 +88,13 @@ fn cell_progress(cell_noise: f32, phase_progress: f32) -> f32 {
     return smoothstep(edge0, edge1, phase_progress);
 }
 
-fn ease_in_out_cubic(x: f32) -> f32 {
-    if (x < 0.5) {
-        return 4.0 * x * x * x;
-    }
+fn ease_out_quart(x: f32) -> f32 {
+    let t = 1.0 - x;
+    return 1.0 - t * t * t * t;
+}
 
-    let t = -2.0 * x + 2.0;
-    return 1.0 - (t * t * t) * 0.5;
+fn ease_in_cubic(x: f32) -> f32 {
+    return x * x * x;
 }
 
 fn timeline_progress(frame_index: u32) -> f32 {
@@ -118,8 +119,7 @@ fn timeline_progress(frame_index: u32) -> f32 {
     }
 
     let active_index = frame_index - hold;
-    let linear_progress = f32(active_index) / f32(transition_frames - 1u);
-    return ease_in_out_cubic(linear_progress);
+    return f32(active_index) / f32(transition_frames - 1u);
 }
 
 fn fit_sample_from(uv: vec2<f32>) -> vec4<f32> {
@@ -178,14 +178,6 @@ fn fit_sample_to(uv: vec2<f32>) -> vec4<f32> {
     return unpack_rgba(to_pixels[index]);
 }
 
-fn normalize_safe(v: vec2<f32>) -> vec2<f32> {
-    let len = length(v);
-    if (len <= 1e-5) {
-        return vec2<f32>(1.0, 0.0);
-    }
-    return v / len;
-}
-
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.out_width || gid.y >= params.out_height || gid.z >= params.chunk_frames) {
@@ -202,51 +194,85 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         (f32(gid.y) + 0.5) / f32(params.out_height)
     );
 
-    // Random-cell reveal inspired by gl-transitions random-square approach.
     let cell = floor(vec2<f32>(GRID_X, GRID_Y) * uv);
-    let r = hash01_vec2(cell, params.seed_lo, params.seed_hi);
+    let cx = u32(cell.x);
+    let cy = u32(cell.y);
+    let cell_center = (cell + 0.5) / vec2<f32>(GRID_X, GRID_Y);
 
-    // Shared shard direction used by both phases.
-    let center = vec2<f32>(0.5, 0.5);
-    let jitter = hash01_vec2(cell + vec2<f32>(31.0, 17.0), params.seed_lo, params.seed_hi);
-    let angle = jitter * 6.28318530718;
-    let random_dir = vec2<f32>(cos(angle), sin(angle));
-    let radial_dir = normalize_safe(uv - center);
-    let shard_dir = normalize_safe(radial_dir * 0.7 + random_dir * 0.3);
+    let r_base  = hash01_u32(cx, cy, params.seed_lo, params.seed_hi);
+    let r_angle = hash_channel(cx, cy, 1u, params.seed_lo, params.seed_hi);
+    let r_speed = hash_channel(cx, cy, 3u, params.seed_lo, params.seed_hi);
+
+    // Forward speed: how fast this cell flies towards the camera.
+    let speed = 0.6 + r_speed * 0.8;
+
+    // Subtle lateral drift direction (random per cell).
+    let drift_angle = r_angle * 6.283185;
+    let drift_dir = vec2<f32>(cos(drift_angle), sin(drift_angle));
+
+    // Wave ordering: edges crack first, centre holds longest.
+    let centre_dist = length(cell_center - vec2<f32>(0.5, 0.5));
+    let centre_factor = clamp(centre_dist / 0.707, 0.0, 1.0);
+    let order = r_base * 0.5 + (1.0 - centre_factor) * 0.5;
+
+    // Perspective vanishing point.
+    let vp = vec2<f32>(0.5, 0.5);
+
     let out_index = gid.z * (params.out_width * params.out_height) + pixel_index;
 
-    // Stage one: shatter the source image outwards.
+    // Stage one: explosion behind the image pushes cells towards the camera.
     if (progress < 0.5) {
-        let phase_progress = progress * 2.0;
-        let disappear = cell_progress(r, phase_progress);
-        let shard_push = phase_progress * (0.18 + 0.35 * r);
-        let from_sample_uv = clamp(uv - shard_dir * shard_push, vec2<f32>(0.0), vec2<f32>(1.0));
-        let from_shard = fit_sample_from(from_sample_uv);
-        let out_alpha = from_shard.a * (1.0 - disappear);
+        let phase = progress * 2.0;
+        let eased = ease_out_quart(phase);
 
-        if (out_alpha <= 0.0) {
+        let disappear = cell_progress(order, phase);
+
+        // Perspective scale: cell approaches camera along Z.
+        let z = eased * speed;
+        let scale = 1.0 / max(1.0 - z, 0.01);
+
+        // Subtle lateral scatter.
+        let drift = drift_dir * eased * speed * 0.06;
+
+        let sample_uv = clamp(
+            vp + (uv - vp - drift) / scale,
+            vec2<f32>(0.0), vec2<f32>(1.0)
+        );
+        let from_color = fit_sample_from(sample_uv);
+        let alpha = from_color.a * (1.0 - disappear) / scale;
+
+        if (alpha <= 0.0) {
             out_pixels[out_index] = pack_rgba(vec4<f32>(0.0, 0.0, 0.0, 0.0));
             return;
         }
-
-        out_pixels[out_index] = pack_rgba(vec4<f32>(from_shard.rgb, out_alpha));
+        out_pixels[out_index] = pack_rgba(vec4<f32>(from_color.rgb, alpha));
         return;
     }
 
-    // Stage two: shatter the target image inwards.
-    let phase_progress = (progress - 0.5) * 2.0;
-    let appear = cell_progress(r, phase_progress);
-    let shard_pull = (1.0 - phase_progress) * (0.18 + 0.35 * r);
-    let to_sample_uv = clamp(uv - shard_dir * shard_pull, vec2<f32>(0.0), vec2<f32>(1.0));
-    let to_shard = fit_sample_to(to_sample_uv);
-    let out_alpha = to_shard.a * appear * phase_progress;
+    // Stage two: target image assembles from scattered state.
+    let phase = (progress - 0.5) * 2.0;
+    let eased = ease_in_cubic(phase);
+    let remaining = 1.0 - eased;
 
-    if (out_alpha <= 0.0) {
+    let appear = cell_progress(order, eased);
+
+    let z = remaining * speed;
+    let scale = 1.0 / max(1.0 - z, 0.01);
+
+    let drift = drift_dir * remaining * speed * 0.06;
+
+    let sample_uv = clamp(
+        vp + (uv - vp - drift) / scale,
+        vec2<f32>(0.0), vec2<f32>(1.0)
+    );
+    let to_color = fit_sample_to(sample_uv);
+    let alpha = to_color.a * appear / scale;
+
+    if (alpha <= 0.0) {
         out_pixels[out_index] = pack_rgba(vec4<f32>(0.0, 0.0, 0.0, 0.0));
         return;
     }
-
-    out_pixels[out_index] = pack_rgba(vec4<f32>(to_shard.rgb, out_alpha));
+    out_pixels[out_index] = pack_rgba(vec4<f32>(to_color.rgb, alpha));
 }
 "#;
 
