@@ -13,6 +13,14 @@ use super::{RenderReceipt, TransitionError, TransitionRequest};
 const MAX_CHUNK_FRAMES: usize = 64;
 const WORKGROUP_SIZE_X: u32 = 8;
 const WORKGROUP_SIZE_Y: u32 = 8;
+const QUANTIZE_WORKGROUP_SIZE: u32 = 256;
+
+// Uniform 6x7x6 RGB cube for GIF quantization.
+const R_LEVELS: u32 = 6;
+const G_LEVELS: u32 = 7;
+const B_LEVELS: u32 = 6;
+const PALETTE_COLORS: usize = (R_LEVELS * G_LEVELS * B_LEVELS) as usize; // 252
+const TRANSPARENT_INDEX: u8 = PALETTE_COLORS as u8; // 252
 
 // Algorithm note:
 // This shader simulates an explosion behind the image plane. All cell-sized
@@ -22,6 +30,7 @@ const WORKGROUP_SIZE_Y: u32 = 8;
 // Once the source image has fully dispersed, the process reverses to assemble
 // the target image.
 const SHATTER_SHADER: &str = include_str!("shatter.wgsl");
+const QUANTIZE_SHADER: &str = include_str!("quantize.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -41,6 +50,13 @@ struct ShatterParams {
     _pad: [u32; 3],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuantizeParams {
+    pixel_count: u32,
+    chunk_frames: u32,
+}
+
 struct DecodedImages {
     from_pixels: Vec<u32>,
     to_pixels: Vec<u32>,
@@ -52,14 +68,16 @@ struct DecodedImages {
 }
 
 /// Long-lived GPU state that is independent of any particular render
-/// request: adapter, device, queue, compiled pipeline, and the bind
-/// group layout. Created lazily on the first render and reused for
+/// request: adapter, device, queue, compiled pipelines, and the bind
+/// group layouts. Created lazily on the first render and reused for
 /// all subsequent renders to avoid repeated device/shader init.
 struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    shatter_pipeline: wgpu::ComputePipeline,
+    shatter_bind_group_layout: wgpu::BindGroupLayout,
+    quantize_pipeline: wgpu::ComputePipeline,
+    quantize_bind_group_layout: wgpu::BindGroupLayout,
     used_fallback_adapter: bool,
 }
 
@@ -67,12 +85,15 @@ struct GpuContext {
 /// output dimensions. Two staging buffers enable overlapping GPU
 /// compute with CPU readback/encoding (double-buffering).
 struct RenderBuffers {
-    bind_group: wgpu::BindGroup,
-    output_buffer: wgpu::Buffer,
+    shatter_bind_group: wgpu::BindGroup,
+    quantize_bind_group: wgpu::BindGroup,
+    index_buffer: wgpu::Buffer,
     staging_buffers: [wgpu::Buffer; 2],
     params_buffer: wgpu::Buffer,
+    quantize_params_buffer: wgpu::Buffer,
     chunk_frames: usize,
-    bytes_per_frame: usize,
+    /// Bytes per frame for the index buffer (ceil(pixel_count/4) * 4).
+    index_bytes_per_frame: usize,
 }
 
 pub(super) struct ShatterTransitionRenderer {
@@ -139,6 +160,8 @@ impl ShatterTransitionRenderer {
         let total_frames = request.frame_count().get();
         let pixel_count = usize::from(out_width) * usize::from(out_height);
 
+        let palette = build_palette();
+
         let mut output_file =
             std::fs::File::create(request.output_path()).map_err(|source| {
                 TransitionError::OutputIo {
@@ -156,6 +179,9 @@ impl ShatterTransitionRenderer {
         let frames_total = usize::from(total_frames);
         let workgroups_x = u32::from(out_width).div_ceil(WORKGROUP_SIZE_X);
         let workgroups_y = u32::from(out_height).div_ceil(WORKGROUP_SIZE_Y);
+        let words_per_frame = pixel_count.div_ceil(4);
+        let quantize_workgroups_x =
+            (words_per_frame as u32).div_ceil(QUANTIZE_WORKGROUP_SIZE);
 
         // Double-buffered dispatch loop: submit chunk N to
         // staging[N%2], then read back chunk N-1 from the other
@@ -163,11 +189,15 @@ impl ShatterTransitionRenderer {
         progress_set_length!(frames_total);
         let mut frame_start = 0usize;
         let mut staging_index = 0usize;
-        let mut pending: Option<(usize, usize, u64)> = None; // (staging_idx, chunk_len, chunk_bytes)
-        let bytes_per_pixel = std::mem::size_of::<u32>();
+        // (staging_idx, chunk_len, chunk_bytes)
+        let mut pending: Option<(usize, usize, u64)> = None;
 
         while frame_start < frames_total {
             let chunk_len = (frames_total - frame_start).min(buffers.chunk_frames);
+            let chunk_len_u32 =
+                u32::try_from(chunk_len).map_err(|_error| TransitionError::GpuFailure {
+                    reason: "dispatch chunk overflow".to_string(),
+                })?;
 
             let params = ShatterParams {
                 out_width: u32::from(out_width),
@@ -182,11 +212,7 @@ impl ShatterTransitionRenderer {
                         reason: "frame start overflow".to_string(),
                     }
                 })?,
-                chunk_frames: u32::try_from(chunk_len).map_err(|_error| {
-                    TransitionError::GpuFailure {
-                        reason: "chunk frame count overflow".to_string(),
-                    }
-                })?,
+                chunk_frames: chunk_len_u32,
                 hold_frames: u32::from(request.hold_frames()),
                 seed_lo: request.seed() as u32,
                 seed_hi: (request.seed() >> 32) as u32,
@@ -195,37 +221,58 @@ impl ShatterTransitionRenderer {
             ctx.queue
                 .write_buffer(&buffers.params_buffer, 0, bytemuck::bytes_of(&params));
 
+            let quantize_params = QuantizeParams {
+                pixel_count: pixel_count as u32,
+                chunk_frames: chunk_len_u32,
+            };
+            ctx.queue.write_buffer(
+                &buffers.quantize_params_buffer,
+                0,
+                bytemuck::bytes_of(&quantize_params),
+            );
+
             let mut command_encoder =
                 ctx.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("shatter-command-encoder"),
                     });
+
+            // Pass 1: shatter effect (RGBA output).
             {
                 let mut pass =
                     command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("shatter-compute-pass"),
                         timestamp_writes: None,
                     });
-                pass.set_pipeline(&ctx.pipeline);
-                pass.set_bind_group(0, &buffers.bind_group, &[]);
+                pass.set_pipeline(&ctx.shatter_pipeline);
+                pass.set_bind_group(0, &buffers.shatter_bind_group, &[]);
+                pass.dispatch_workgroups(workgroups_x, workgroups_y, chunk_len_u32);
+            }
+
+            // Pass 2: quantize RGBA to palette indices.
+            {
+                let mut pass =
+                    command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("quantize-compute-pass"),
+                        timestamp_writes: None,
+                    });
+                pass.set_pipeline(&ctx.quantize_pipeline);
+                pass.set_bind_group(0, &buffers.quantize_bind_group, &[]);
                 pass.dispatch_workgroups(
-                    workgroups_x,
-                    workgroups_y,
-                    u32::try_from(chunk_len).map_err(|_error| {
-                        TransitionError::GpuFailure {
-                            reason: "dispatch chunk overflow".to_string(),
-                        }
-                    })?,
+                    quantize_workgroups_x,
+                    1,
+                    chunk_len_u32,
                 );
             }
 
-            let chunk_bytes = u64::try_from(chunk_len * buffers.bytes_per_frame).map_err(
-                |_error| TransitionError::GpuFailure {
-                    reason: "chunk byte size overflow".to_string(),
-                },
-            )?;
+            let chunk_bytes =
+                u64::try_from(chunk_len * buffers.index_bytes_per_frame).map_err(
+                    |_error| TransitionError::GpuFailure {
+                        reason: "chunk byte size overflow".to_string(),
+                    },
+                )?;
             command_encoder.copy_buffer_to_buffer(
-                &buffers.output_buffer,
+                &buffers.index_buffer,
                 0,
                 &buffers.staging_buffers[staging_index],
                 0,
@@ -235,25 +282,21 @@ impl ShatterTransitionRenderer {
 
             // While the GPU computes chunk N, read back chunk N-1.
             if let Some((prev_staging, prev_len, prev_bytes)) = pending.take() {
-                let mapped_bytes = map_staging_chunk(
-                    &ctx.device,
-                    &buffers.staging_buffers[prev_staging],
+                encode_indexed_frames(
+                    &ctx,
+                    &buffers,
+                    prev_staging,
+                    prev_len,
                     prev_bytes,
+                    pixel_count,
+                    words_per_frame,
+                    out_width,
+                    out_height,
+                    delay,
+                    &palette,
+                    &mut encoder,
                 )?;
-                for local_index in 0..prev_len {
-                    let byte_start = local_index * pixel_count * bytes_per_pixel;
-                    let byte_end = byte_start + pixel_count * bytes_per_pixel;
-                    let mut rgba = mapped_bytes[byte_start..byte_end].to_vec();
-
-                    let mut frame =
-                        gif::Frame::from_rgba_speed(out_width, out_height, &mut rgba, 10);
-                    frame.delay = delay;
-                    frame.dispose = gif::DisposalMethod::Background;
-                    encoder
-                        .write_frame(&frame)
-                        .map_err(|source| TransitionError::GifEncoding { source })?;
-                    progress_inc!();
-                }
+                progress_inc!(prev_len);
             }
 
             pending = Some((staging_index, chunk_len, chunk_bytes));
@@ -263,25 +306,21 @@ impl ShatterTransitionRenderer {
 
         // Flush the final pending chunk.
         if let Some((prev_staging, prev_len, prev_bytes)) = pending.take() {
-            let mapped_bytes = map_staging_chunk(
-                &ctx.device,
-                &buffers.staging_buffers[prev_staging],
+            encode_indexed_frames(
+                &ctx,
+                &buffers,
+                prev_staging,
+                prev_len,
                 prev_bytes,
+                pixel_count,
+                words_per_frame,
+                out_width,
+                out_height,
+                delay,
+                &palette,
+                &mut encoder,
             )?;
-            for local_index in 0..prev_len {
-                let byte_start = local_index * pixel_count * bytes_per_pixel;
-                let byte_end = byte_start + pixel_count * bytes_per_pixel;
-                let mut rgba = mapped_bytes[byte_start..byte_end].to_vec();
-
-                let mut frame =
-                    gif::Frame::from_rgba_speed(out_width, out_height, &mut rgba, 10);
-                frame.delay = delay;
-                frame.dispose = gif::DisposalMethod::Background;
-                encoder
-                    .write_frame(&frame)
-                    .map_err(|source| TransitionError::GifEncoding { source })?;
-                progress_inc!();
-            }
+            progress_inc!(prev_len);
         }
 
         info!(
@@ -299,6 +338,76 @@ impl ShatterTransitionRenderer {
             request.fps().get(),
         ))
     }
+}
+
+/// Read back index data from a staging buffer and write GIF frames.
+fn encode_indexed_frames(
+    ctx: &GpuContext,
+    buffers: &RenderBuffers,
+    staging_index: usize,
+    chunk_len: usize,
+    chunk_bytes: u64,
+    pixel_count: usize,
+    words_per_frame: usize,
+    out_width: u16,
+    out_height: u16,
+    delay: u16,
+    palette: &[u8],
+    encoder: &mut gif::Encoder<&mut std::fs::File>,
+) -> Result<(), TransitionError> {
+    let mapped_bytes = map_staging_chunk(
+        &ctx.device,
+        &buffers.staging_buffers[staging_index],
+        chunk_bytes,
+    )?;
+    let bytes_per_frame = words_per_frame * std::mem::size_of::<u32>();
+    for local_index in 0..chunk_len {
+        let byte_start = local_index * bytes_per_frame;
+        let byte_end = byte_start + bytes_per_frame;
+        let packed = &mapped_bytes[byte_start..byte_end];
+        // Each u32 word contains 4 packed indices (one per byte).
+        // Truncate to exactly pixel_count indices.
+        let indices: Vec<u8> = packed.iter().copied().take(pixel_count).collect();
+
+        let frame = gif::Frame::from_palette_pixels(
+            out_width,
+            out_height,
+            indices,
+            palette,
+            Some(TRANSPARENT_INDEX),
+        );
+        let mut frame = frame;
+        frame.delay = delay;
+        frame.dispose = gif::DisposalMethod::Background;
+        encoder
+            .write_frame(&frame)
+            .map_err(|source| TransitionError::GifEncoding { source })?;
+    }
+    Ok(())
+}
+
+/// Build the 6x7x6 uniform RGB palette (252 colours) plus one
+/// transparent entry at index 252. Returns packed RGB triplets
+/// suitable for `gif::Frame::from_palette_pixels`.
+fn build_palette() -> Vec<u8> {
+    let mut palette = Vec::with_capacity((PALETTE_COLORS + 1) * 3);
+    for ri in 0..R_LEVELS {
+        for gi in 0..G_LEVELS {
+            for bi in 0..B_LEVELS {
+                let r = ((ri * 255) / (R_LEVELS - 1)) as u8;
+                let g = ((gi * 255) / (G_LEVELS - 1)) as u8;
+                let b = ((bi * 255) / (B_LEVELS - 1)) as u8;
+                palette.push(r);
+                palette.push(g);
+                palette.push(b);
+            }
+        }
+    }
+    // Transparent colour (value doesn't matter; alpha handles it).
+    palette.push(0);
+    palette.push(0);
+    palette.push(0);
+    palette
 }
 
 fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionError> {
@@ -376,65 +485,60 @@ fn init_gpu_context() -> Result<GpuContext, TransitionError> {
         reason: format!("request_device failed: {error}"),
     })?;
 
-    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("shatter-bind-group-layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("shatter-pipeline-layout"),
-        bind_group_layouts: &[&bind_group_layout],
-        push_constant_ranges: &[],
-    });
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    // --- Shatter pipeline ---
+    let shatter_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shatter-bind-group-layout"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, true),
+                storage_entry(2, false),
+                uniform_entry(3),
+            ],
+        });
+    let shatter_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("shatter-pipeline-layout"),
+            bind_group_layouts: &[&shatter_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let shatter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("shatter-shader"),
         source: wgpu::ShaderSource::Wgsl(SHATTER_SHADER.into()),
     });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let shatter_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("shatter-pipeline"),
-        layout: Some(&pipeline_layout),
-        module: &shader,
+        layout: Some(&shatter_pipeline_layout),
+        module: &shatter_shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+
+    // --- Quantize pipeline ---
+    let quantize_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("quantize-bind-group-layout"),
+            entries: &[
+                storage_entry(0, true),
+                storage_entry(1, false),
+                uniform_entry(2),
+            ],
+        });
+    let quantize_pipeline_layout =
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("quantize-pipeline-layout"),
+            bind_group_layouts: &[&quantize_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+    let quantize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("quantize-shader"),
+        source: wgpu::ShaderSource::Wgsl(QUANTIZE_SHADER.into()),
+    });
+    let quantize_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("quantize-pipeline"),
+        layout: Some(&quantize_pipeline_layout),
+        module: &quantize_shader,
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
@@ -443,10 +547,38 @@ fn init_gpu_context() -> Result<GpuContext, TransitionError> {
     Ok(GpuContext {
         device,
         queue,
-        pipeline,
-        bind_group_layout,
+        shatter_pipeline,
+        shatter_bind_group_layout,
+        quantize_pipeline,
+        quantize_bind_group_layout,
         used_fallback_adapter,
     })
+}
+
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 fn create_render_buffers(
@@ -469,24 +601,42 @@ fn create_render_buffers(
     let out_width = images.dimensions.width();
     let out_height = images.dimensions.height();
     let pixel_count = usize::from(out_width) * usize::from(out_height);
-    let bytes_per_frame = pixel_count
+    let rgba_bytes_per_frame = pixel_count
         .checked_mul(std::mem::size_of::<u32>())
         .ok_or_else(|| TransitionError::GpuFailure {
             reason: "frame byte size overflow".to_string(),
         })?;
 
-    let chunk_frames = compute_chunk_frames(&ctx.device, total_frames, bytes_per_frame)?;
+    // Index buffer: each pixel → 1 byte, packed 4 per u32.
+    let words_per_frame = pixel_count.div_ceil(4);
+    let index_bytes_per_frame = words_per_frame * std::mem::size_of::<u32>();
+
+    let chunk_frames =
+        compute_chunk_frames(&ctx.device, total_frames, rgba_bytes_per_frame)?;
+
     let output_buffer_size =
-        u64::try_from(chunk_frames * bytes_per_frame).map_err(|_error| {
+        u64::try_from(chunk_frames * rgba_bytes_per_frame).map_err(|_error| {
             TransitionError::GpuFailure {
                 reason: "output buffer size overflow".to_string(),
             }
         })?;
-    let staging_buffer_size = align_to(output_buffer_size, wgpu::MAP_ALIGNMENT);
+    let index_buffer_size =
+        u64::try_from(chunk_frames * index_bytes_per_frame).map_err(|_error| {
+            TransitionError::GpuFailure {
+                reason: "index buffer size overflow".to_string(),
+            }
+        })?;
+    let staging_buffer_size = align_to(index_buffer_size, wgpu::MAP_ALIGNMENT);
 
     let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("output-buffer"),
         size: output_buffer_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let index_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("index-buffer"),
+        size: index_buffer_size,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -510,10 +660,16 @@ fn create_render_buffers(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let quantize_params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("quantize-params-buffer"),
+        size: std::mem::size_of::<QuantizeParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
 
-    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let shatter_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("shatter-bind-group"),
-        layout: &ctx.bind_group_layout,
+        layout: &ctx.shatter_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -534,13 +690,34 @@ fn create_render_buffers(
         ],
     });
 
+    let quantize_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("quantize-bind-group"),
+        layout: &ctx.quantize_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: output_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: index_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: quantize_params_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
     Ok(RenderBuffers {
-        bind_group,
-        output_buffer,
+        shatter_bind_group,
+        quantize_bind_group,
+        index_buffer,
         staging_buffers,
         params_buffer,
+        quantize_params_buffer,
         chunk_frames,
-        bytes_per_frame,
+        index_bytes_per_frame,
     })
 }
 
@@ -673,5 +850,17 @@ mod tests {
     fn align_to_rounds_up() {
         assert_eq!(256, align_to(255, 256));
         assert_eq!(512, align_to(512, 256));
+    }
+
+    #[test]
+    fn build_palette_has_correct_size_and_entries() {
+        let palette = build_palette();
+        // 252 colours + 1 transparent = 253 entries, 3 bytes each
+        assert_eq!(253 * 3, palette.len());
+        // First entry: R=0, G=0, B=0
+        assert_eq!([0, 0, 0], &palette[0..3]);
+        // Last non-transparent: R=255, G=255, B=255
+        let last = (PALETTE_COLORS - 1) * 3;
+        assert_eq!([255, 255, 255], &palette[last..last + 3]);
     }
 }
