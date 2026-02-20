@@ -39,6 +39,29 @@ struct ShatterParams {
     _pad: [u32; 3],
 }
 
+struct DecodedImages {
+    from_pixels: Vec<u32>,
+    to_pixels: Vec<u32>,
+    from_width: u16,
+    from_height: u16,
+    to_width: u16,
+    to_height: u16,
+    dimensions: PanelDimensions,
+}
+
+struct GpuPipeline {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    output_buffer: wgpu::Buffer,
+    staging_buffer: wgpu::Buffer,
+    params_buffer: wgpu::Buffer,
+    chunk_frames: usize,
+    bytes_per_frame: usize,
+    used_fallback_adapter: bool,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ShatterTransitionRenderer;
 
@@ -60,208 +83,21 @@ impl ShatterTransitionRenderer {
         &self,
         request: &TransitionRequest,
     ) -> Result<RenderReceipt, TransitionError> {
-        let from_image = ImagePreprocessor::decode_oriented_from_path(request.from_path())
-            .map_err(|source| TransitionError::SourceImage {
-                path: request.from_path().to_path_buf(),
-                source,
-            })?;
-        let to_image =
-            ImagePreprocessor::decode_oriented_from_path(request.to_path()).map_err(|source| {
-                TransitionError::SourceImage {
-                    path: request.to_path().to_path_buf(),
+        let images = load_images(request)?;
+        let gpu = init_gpu_pipeline(&images, request)?;
+
+        let out_width = images.dimensions.width();
+        let out_height = images.dimensions.height();
+        let total_frames = request.frame_count().get();
+        let pixel_count = usize::from(out_width) * usize::from(out_height);
+
+        let mut output_file =
+            std::fs::File::create(request.output_path()).map_err(|source| {
+                TransitionError::OutputIo {
+                    path: request.output_path().to_path_buf(),
                     source,
                 }
             })?;
-
-        let from_width =
-            u16::try_from(from_image.width()).map_err(|_error| TransitionError::GpuFailure {
-                reason: "source image width exceeds u16 range".to_string(),
-            })?;
-        let from_height =
-            u16::try_from(from_image.height()).map_err(|_error| TransitionError::GpuFailure {
-                reason: "source image height exceeds u16 range".to_string(),
-            })?;
-        let to_width =
-            u16::try_from(to_image.width()).map_err(|_error| TransitionError::GpuFailure {
-                reason: "target image width exceeds u16 range".to_string(),
-            })?;
-        let to_height =
-            u16::try_from(to_image.height()).map_err(|_error| TransitionError::GpuFailure {
-                reason: "target image height exceeds u16 range".to_string(),
-            })?;
-        let from_dimensions = PanelDimensions::new(from_width, from_height).ok_or_else(|| {
-            TransitionError::GpuFailure {
-                reason: "source image dimensions must be non-zero".to_string(),
-            }
-        })?;
-        let to_dimensions = PanelDimensions::new(to_width, to_height).ok_or_else(|| {
-            TransitionError::GpuFailure {
-                reason: "target image dimensions must be non-zero".to_string(),
-            }
-        })?;
-        let dimensions = request.size().resolve(from_dimensions, to_dimensions);
-        let out_width = dimensions.width();
-        let out_height = dimensions.height();
-
-        let from_pixels = pack_rgba_to_u32(from_image.as_raw());
-        let to_pixels = pack_rgba_to_u32(to_image.as_raw());
-
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let (adapter, used_fallback_adapter) = request_adapter(&instance)?;
-        if used_fallback_adapter {
-            warn!("hardware adapter unavailable; using fallback adapter");
-        }
-
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("shatter-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|error| TransitionError::GpuFailure {
-            reason: format!("request_device failed: {error}"),
-        })?;
-
-        let from_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("from-buffer"),
-            contents: bytemuck::cast_slice(&from_pixels),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let to_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("to-buffer"),
-            contents: bytemuck::cast_slice(&to_pixels),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let total_frames = request.frame_count().get();
-        let pixel_count = usize::from(out_width) * usize::from(out_height);
-        let bytes_per_frame = pixel_count
-            .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| TransitionError::GpuFailure {
-                reason: "frame byte size overflow".to_string(),
-            })?;
-
-        let chunk_frames = compute_chunk_frames(&device, total_frames, bytes_per_frame)?;
-        let output_buffer_size =
-            u64::try_from(chunk_frames * bytes_per_frame).map_err(|_error| {
-                TransitionError::GpuFailure {
-                    reason: "output buffer size overflow".to_string(),
-                }
-            })?;
-        let staging_buffer_size = align_to(output_buffer_size, wgpu::MAP_ALIGNMENT);
-
-        let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("output-buffer"),
-            size: output_buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging-buffer"),
-            size: staging_buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("params-buffer"),
-            size: std::mem::size_of::<ShatterParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shatter-bind-group-layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shatter-pipeline-layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("shatter-shader"),
-            source: wgpu::ShaderSource::Wgsl(SHATTER_SHADER.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("shatter-pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shatter-bind-group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: from_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: to_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut output_file = std::fs::File::create(request.output_path()).map_err(|source| {
-            TransitionError::OutputIo {
-                path: request.output_path().to_path_buf(),
-                source,
-            }
-        })?;
         let mut encoder = gif::Encoder::new(&mut output_file, out_width, out_height, &[])
             .map_err(|source| TransitionError::GifEncoding { source })?;
         encoder
@@ -276,15 +112,15 @@ impl ShatterTransitionRenderer {
         progress_set_length!(frames_total);
         let mut frame_start = 0usize;
         while frame_start < frames_total {
-            let chunk_len = (frames_total - frame_start).min(chunk_frames);
+            let chunk_len = (frames_total - frame_start).min(gpu.chunk_frames);
 
             let params = ShatterParams {
                 out_width: u32::from(out_width),
                 out_height: u32::from(out_height),
-                from_width: u32::from(from_width),
-                from_height: u32::from(from_height),
-                to_width: u32::from(to_width),
-                to_height: u32::from(to_height),
+                from_width: u32::from(images.from_width),
+                from_height: u32::from(images.from_height),
+                to_width: u32::from(images.to_width),
+                to_height: u32::from(images.to_height),
                 total_frames: u32::from(total_frames),
                 frame_start: u32::try_from(frame_start).map_err(|_error| {
                     TransitionError::GpuFailure {
@@ -301,50 +137,57 @@ impl ShatterTransitionRenderer {
                 seed_hi: (request.seed() >> 32) as u32,
                 _pad: [0; 3],
             };
-            queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
+            gpu.queue
+                .write_buffer(&gpu.params_buffer, 0, bytemuck::bytes_of(&params));
 
             let mut command_encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("shatter-command-encoder"),
-                });
+                gpu.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("shatter-command-encoder"),
+                    });
             {
-                let mut pass = command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("shatter-compute-pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&pipeline);
-                pass.set_bind_group(0, &bind_group, &[]);
+                let mut pass =
+                    command_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("shatter-compute-pass"),
+                        timestamp_writes: None,
+                    });
+                pass.set_pipeline(&gpu.pipeline);
+                pass.set_bind_group(0, &gpu.bind_group, &[]);
                 pass.dispatch_workgroups(
                     workgroups_x,
                     workgroups_y,
-                    u32::try_from(chunk_len).map_err(|_error| TransitionError::GpuFailure {
-                        reason: "dispatch chunk overflow".to_string(),
+                    u32::try_from(chunk_len).map_err(|_error| {
+                        TransitionError::GpuFailure {
+                            reason: "dispatch chunk overflow".to_string(),
+                        }
                     })?,
                 );
             }
 
-            let chunk_bytes = u64::try_from(chunk_len * bytes_per_frame).map_err(|_error| {
-                TransitionError::GpuFailure {
+            let chunk_bytes = u64::try_from(chunk_len * gpu.bytes_per_frame).map_err(
+                |_error| TransitionError::GpuFailure {
                     reason: "chunk byte size overflow".to_string(),
-                }
-            })?;
+                },
+            )?;
             command_encoder.copy_buffer_to_buffer(
-                &output_buffer,
+                &gpu.output_buffer,
                 0,
-                &staging_buffer,
+                &gpu.staging_buffer,
                 0,
                 chunk_bytes,
             );
-            queue.submit(Some(command_encoder.finish()));
+            gpu.queue.submit(Some(command_encoder.finish()));
 
-            let mapped_bytes = map_staging_chunk(&device, &staging_buffer, chunk_bytes)?;
+            let mapped_bytes =
+                map_staging_chunk(&gpu.device, &gpu.staging_buffer, chunk_bytes)?;
             let bytes_per_pixel = std::mem::size_of::<u32>();
             for local_index in 0..chunk_len {
                 let byte_start = local_index * pixel_count * bytes_per_pixel;
                 let byte_end = byte_start + pixel_count * bytes_per_pixel;
                 let mut rgba = mapped_bytes[byte_start..byte_end].to_vec();
 
-                let mut frame = gif::Frame::from_rgba_speed(out_width, out_height, &mut rgba, 10);
+                let mut frame =
+                    gif::Frame::from_rgba_speed(out_width, out_height, &mut rgba, 10);
                 frame.delay = delay;
                 frame.dispose = gif::DisposalMethod::Background;
                 encoder
@@ -358,19 +201,246 @@ impl ShatterTransitionRenderer {
 
         info!(
             backend = "shatter",
-            adapter_fallback = used_fallback_adapter,
+            adapter_fallback = gpu.used_fallback_adapter,
             requested_size = %request.size(),
-            dimensions = %dimensions,
+            dimensions = %images.dimensions,
             "render complete"
         );
 
         Ok(RenderReceipt::new(
             request.output_path().to_path_buf(),
-            dimensions,
+            images.dimensions,
             total_frames,
             request.fps().get(),
         ))
     }
+}
+
+fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionError> {
+    let from_image = ImagePreprocessor::decode_oriented_from_path(request.from_path())
+        .map_err(|source| TransitionError::SourceImage {
+            path: request.from_path().to_path_buf(),
+            source,
+        })?;
+    let to_image =
+        ImagePreprocessor::decode_oriented_from_path(request.to_path()).map_err(|source| {
+            TransitionError::SourceImage {
+                path: request.to_path().to_path_buf(),
+                source,
+            }
+        })?;
+
+    let from_width =
+        u16::try_from(from_image.width()).map_err(|_error| TransitionError::GpuFailure {
+            reason: "source image width exceeds u16 range".to_string(),
+        })?;
+    let from_height =
+        u16::try_from(from_image.height()).map_err(|_error| TransitionError::GpuFailure {
+            reason: "source image height exceeds u16 range".to_string(),
+        })?;
+    let to_width =
+        u16::try_from(to_image.width()).map_err(|_error| TransitionError::GpuFailure {
+            reason: "target image width exceeds u16 range".to_string(),
+        })?;
+    let to_height =
+        u16::try_from(to_image.height()).map_err(|_error| TransitionError::GpuFailure {
+            reason: "target image height exceeds u16 range".to_string(),
+        })?;
+
+    let from_dimensions = PanelDimensions::new(from_width, from_height).ok_or_else(|| {
+        TransitionError::GpuFailure {
+            reason: "source image dimensions must be non-zero".to_string(),
+        }
+    })?;
+    let to_dimensions = PanelDimensions::new(to_width, to_height).ok_or_else(|| {
+        TransitionError::GpuFailure {
+            reason: "target image dimensions must be non-zero".to_string(),
+        }
+    })?;
+    let dimensions = request.size().resolve(from_dimensions, to_dimensions);
+
+    let from_pixels = pack_rgba_to_u32(from_image.as_raw());
+    let to_pixels = pack_rgba_to_u32(to_image.as_raw());
+
+    Ok(DecodedImages {
+        from_pixels,
+        to_pixels,
+        from_width,
+        from_height,
+        to_width,
+        to_height,
+        dimensions,
+    })
+}
+
+fn init_gpu_pipeline(
+    images: &DecodedImages,
+    request: &TransitionRequest,
+) -> Result<GpuPipeline, TransitionError> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let (adapter, used_fallback_adapter) = request_adapter(&instance)?;
+    if used_fallback_adapter {
+        warn!("hardware adapter unavailable; using fallback adapter");
+    }
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("shatter-device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::downlevel_defaults(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
+    .map_err(|error| TransitionError::GpuFailure {
+        reason: format!("request_device failed: {error}"),
+    })?;
+
+    let from_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("from-buffer"),
+        contents: bytemuck::cast_slice(&images.from_pixels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let to_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("to-buffer"),
+        contents: bytemuck::cast_slice(&images.to_pixels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let total_frames = request.frame_count().get();
+    let out_width = images.dimensions.width();
+    let out_height = images.dimensions.height();
+    let pixel_count = usize::from(out_width) * usize::from(out_height);
+    let bytes_per_frame = pixel_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| TransitionError::GpuFailure {
+            reason: "frame byte size overflow".to_string(),
+        })?;
+
+    let chunk_frames = compute_chunk_frames(&device, total_frames, bytes_per_frame)?;
+    let output_buffer_size =
+        u64::try_from(chunk_frames * bytes_per_frame).map_err(|_error| {
+            TransitionError::GpuFailure {
+                reason: "output buffer size overflow".to_string(),
+            }
+        })?;
+    let staging_buffer_size = align_to(output_buffer_size, wgpu::MAP_ALIGNMENT);
+
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("output-buffer"),
+        size: output_buffer_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging-buffer"),
+        size: staging_buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("params-buffer"),
+        size: std::mem::size_of::<ShatterParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("shatter-bind-group-layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shatter-pipeline-layout"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("shatter-shader"),
+        source: wgpu::ShaderSource::Wgsl(SHATTER_SHADER.into()),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("shatter-pipeline"),
+        layout: Some(&pipeline_layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shatter-bind-group"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: from_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: to_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: output_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    Ok(GpuPipeline {
+        device,
+        queue,
+        pipeline,
+        bind_group,
+        output_buffer,
+        staging_buffer,
+        params_buffer,
+        chunk_frames,
+        bytes_per_frame,
+        used_fallback_adapter,
+    })
 }
 
 fn request_adapter(instance: &wgpu::Instance) -> Result<(wgpu::Adapter, bool), TransitionError> {
