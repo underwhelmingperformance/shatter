@@ -270,6 +270,8 @@ impl ShatterTransitionRenderer {
 
         let delay = fps_to_delay_centiseconds(request.fps().get());
         let frames_total = usize::from(total_frames);
+        let workgroups_x = u32::from(out_width).div_ceil(WORKGROUP_SIZE_X);
+        let workgroups_y = u32::from(out_height).div_ceil(WORKGROUP_SIZE_Y);
 
         progress_set_length!(frames_total);
         let mut frame_start = 0usize;
@@ -313,8 +315,8 @@ impl ShatterTransitionRenderer {
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(
-                    u32::from(out_width).div_ceil(WORKGROUP_SIZE_X),
-                    u32::from(out_height).div_ceil(WORKGROUP_SIZE_Y),
+                    workgroups_x,
+                    workgroups_y,
                     u32::try_from(chunk_len).map_err(|_error| TransitionError::GpuFailure {
                         reason: "dispatch chunk overflow".to_string(),
                     })?,
