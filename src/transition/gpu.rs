@@ -21,6 +21,24 @@ const WORKGROUP_SIZE_Y: u32 = 8;
 // the target image.
 const SHATTER_SHADER: &str = include_str!("shatter.wgsl");
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShatterParams {
+    out_width: u32,
+    out_height: u32,
+    from_width: u32,
+    from_height: u32,
+    to_width: u32,
+    to_height: u32,
+    total_frames: u32,
+    frame_start: u32,
+    chunk_frames: u32,
+    hold_frames: u32,
+    seed_lo: u32,
+    seed_hi: u32,
+    _pad: [u32; 3],
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ShatterTransitionRenderer;
 
@@ -147,7 +165,7 @@ impl ShatterTransitionRenderer {
         });
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params-buffer"),
-            size: 64,
+            size: std::mem::size_of::<ShatterParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -258,28 +276,30 @@ impl ShatterTransitionRenderer {
         while frame_start < frames_total {
             let chunk_len = (frames_total - frame_start).min(chunk_frames);
 
-            let params = [
-                u32::from(out_width),
-                u32::from(out_height),
-                u32::from(from_width),
-                u32::from(from_height),
-                u32::from(to_width),
-                u32::from(to_height),
-                u32::from(total_frames),
-                u32::try_from(frame_start).map_err(|_error| TransitionError::GpuFailure {
-                    reason: "frame start overflow".to_string(),
+            let params = ShatterParams {
+                out_width: u32::from(out_width),
+                out_height: u32::from(out_height),
+                from_width: u32::from(from_width),
+                from_height: u32::from(from_height),
+                to_width: u32::from(to_width),
+                to_height: u32::from(to_height),
+                total_frames: u32::from(total_frames),
+                frame_start: u32::try_from(frame_start).map_err(|_error| {
+                    TransitionError::GpuFailure {
+                        reason: "frame start overflow".to_string(),
+                    }
                 })?,
-                u32::try_from(chunk_len).map_err(|_error| TransitionError::GpuFailure {
-                    reason: "chunk frame count overflow".to_string(),
+                chunk_frames: u32::try_from(chunk_len).map_err(|_error| {
+                    TransitionError::GpuFailure {
+                        reason: "chunk frame count overflow".to_string(),
+                    }
                 })?,
-                u32::from(request.hold_frames()),
-                request.seed() as u32,
-                (request.seed() >> 32) as u32,
-                0,
-                0,
-                0,
-            ];
-            queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));
+                hold_frames: u32::from(request.hold_frames()),
+                seed_lo: request.seed() as u32,
+                seed_hi: (request.seed() >> 32) as u32,
+                _pad: [0; 3],
+            };
+            queue.write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
 
             let mut command_encoder =
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
