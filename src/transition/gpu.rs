@@ -52,7 +52,7 @@ var<uniform> params: Params;
 
 const GRID_X: f32 = 20.0;
 const GRID_Y: f32 = 20.0;
-const SMOOTHNESS: f32 = 0.08;
+const SMOOTHNESS: f32 = 0.25;
 
 fn unpack_rgba(pixel: u32) -> vec4<f32> {
     let r = f32(pixel & 0xFFu) / 255.0;
@@ -213,7 +213,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Wave ordering: edges crack first, centre holds longest.
     let centre_dist = length(cell_center - vec2<f32>(0.5, 0.5));
     let centre_factor = clamp(centre_dist / 0.707, 0.0, 1.0);
-    let order = r_base * 0.5 + (1.0 - centre_factor) * 0.5;
+    let order = 0.25 + r_base * 0.25 + (1.0 - centre_factor) * 0.25;
 
     // Perspective vanishing point.
     let vp = vec2<f32>(0.5, 0.5);
@@ -231,11 +231,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let z = eased * speed;
         let scale = 1.0 / max(1.0 - z, 0.01);
 
-        // Subtle lateral scatter.
-        let drift = drift_dir * eased * speed * 0.06;
+        // Lateral scatter applied after the perspective division so it stays
+        // visible even at high zoom (centre cells won't look static).
+        let drift = drift_dir * eased * speed * 0.15;
 
         let sample_uv = clamp(
-            vp + (uv - vp - drift) / scale,
+            vp + (uv - vp) / scale - drift,
             vec2<f32>(0.0), vec2<f32>(1.0)
         );
         let from_color = fit_sample_from(sample_uv);
@@ -259,10 +260,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let z = remaining * speed;
     let scale = 1.0 / max(1.0 - z, 0.01);
 
-    let drift = drift_dir * remaining * speed * 0.06;
+    let drift = drift_dir * remaining * speed * 0.15;
 
     let sample_uv = clamp(
-        vp + (uv - vp - drift) / scale,
+        vp + (uv - vp) / scale - drift,
         vec2<f32>(0.0), vec2<f32>(1.0)
     );
     let to_color = fit_sample_to(sample_uv);
