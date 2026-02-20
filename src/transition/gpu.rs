@@ -93,10 +93,6 @@ fn ease_out_quart(x: f32) -> f32 {
     return 1.0 - t * t * t * t;
 }
 
-fn ease_in_cubic(x: f32) -> f32 {
-    return x * x * x;
-}
-
 fn timeline_progress(frame_index: u32) -> f32 {
     if (params.total_frames <= 1u) {
         return 1.0;
@@ -252,10 +248,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Stage two: target image assembles from scattered state.
     let phase = (progress - 0.5) * 2.0;
-    let eased = ease_in_cubic(phase);
-    let remaining = 1.0 - eased;
+    let remaining = 1.0 - phase;
 
-    let appear = cell_progress(order, eased);
+    let appear = cell_progress(order, phase);
 
     let z = remaining * speed;
     let scale = 1.0 / max(1.0 - z, 0.01);
