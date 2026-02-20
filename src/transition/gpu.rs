@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use shatter_macros::progress;
 use tracing::{info, warn};
 use wgpu::util::DeviceExt;
@@ -49,25 +51,69 @@ struct DecodedImages {
     dimensions: PanelDimensions,
 }
 
-struct GpuPipeline {
+/// Long-lived GPU state that is independent of any particular render
+/// request: adapter, device, queue, compiled pipeline, and the bind
+/// group layout. Created lazily on the first render and reused for
+/// all subsequent renders to avoid repeated device/shader init.
+struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    used_fallback_adapter: bool,
+}
+
+/// Per-render GPU resources whose sizes depend on the input images and
+/// output dimensions.
+struct RenderBuffers {
     bind_group: wgpu::BindGroup,
     output_buffer: wgpu::Buffer,
     staging_buffer: wgpu::Buffer,
     params_buffer: wgpu::Buffer,
     chunk_frames: usize,
     bytes_per_frame: usize,
-    used_fallback_adapter: bool,
 }
 
-#[derive(Debug, Default)]
-pub(super) struct ShatterTransitionRenderer;
+pub(super) struct ShatterTransitionRenderer {
+    gpu: Mutex<Option<Arc<GpuContext>>>,
+}
+
+impl std::fmt::Debug for ShatterTransitionRenderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let initialized = self
+            .gpu
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        f.debug_struct("ShatterTransitionRenderer")
+            .field("gpu_initialized", &initialized)
+            .finish()
+    }
+}
+
+impl Default for ShatterTransitionRenderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ShatterTransitionRenderer {
     pub(super) fn new() -> Self {
-        Self
+        Self {
+            gpu: Mutex::new(None),
+        }
+    }
+
+    fn ensure_gpu_context(&self) -> Result<Arc<GpuContext>, TransitionError> {
+        let mut guard = self.gpu.lock().map_err(|_error| {
+            TransitionError::GpuFailure {
+                reason: "GPU context lock poisoned".to_string(),
+            }
+        })?;
+        if guard.is_none() {
+            *guard = Some(Arc::new(init_gpu_context()?));
+        }
+        Ok(Arc::clone(guard.as_ref().unwrap()))
     }
 
     #[progress(
@@ -84,7 +130,8 @@ impl ShatterTransitionRenderer {
         request: &TransitionRequest,
     ) -> Result<RenderReceipt, TransitionError> {
         let images = load_images(request)?;
-        let gpu = init_gpu_pipeline(&images, request)?;
+        let ctx = self.ensure_gpu_context()?;
+        let buffers = create_render_buffers(&ctx, &images, request)?;
 
         let out_width = images.dimensions.width();
         let out_height = images.dimensions.height();
@@ -112,7 +159,7 @@ impl ShatterTransitionRenderer {
         progress_set_length!(frames_total);
         let mut frame_start = 0usize;
         while frame_start < frames_total {
-            let chunk_len = (frames_total - frame_start).min(gpu.chunk_frames);
+            let chunk_len = (frames_total - frame_start).min(buffers.chunk_frames);
 
             let params = ShatterParams {
                 out_width: u32::from(out_width),
@@ -137,11 +184,11 @@ impl ShatterTransitionRenderer {
                 seed_hi: (request.seed() >> 32) as u32,
                 _pad: [0; 3],
             };
-            gpu.queue
-                .write_buffer(&gpu.params_buffer, 0, bytemuck::bytes_of(&params));
+            ctx.queue
+                .write_buffer(&buffers.params_buffer, 0, bytemuck::bytes_of(&params));
 
             let mut command_encoder =
-                gpu.device
+                ctx.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("shatter-command-encoder"),
                     });
@@ -151,8 +198,8 @@ impl ShatterTransitionRenderer {
                         label: Some("shatter-compute-pass"),
                         timestamp_writes: None,
                     });
-                pass.set_pipeline(&gpu.pipeline);
-                pass.set_bind_group(0, &gpu.bind_group, &[]);
+                pass.set_pipeline(&ctx.pipeline);
+                pass.set_bind_group(0, &buffers.bind_group, &[]);
                 pass.dispatch_workgroups(
                     workgroups_x,
                     workgroups_y,
@@ -164,22 +211,22 @@ impl ShatterTransitionRenderer {
                 );
             }
 
-            let chunk_bytes = u64::try_from(chunk_len * gpu.bytes_per_frame).map_err(
+            let chunk_bytes = u64::try_from(chunk_len * buffers.bytes_per_frame).map_err(
                 |_error| TransitionError::GpuFailure {
                     reason: "chunk byte size overflow".to_string(),
                 },
             )?;
             command_encoder.copy_buffer_to_buffer(
-                &gpu.output_buffer,
+                &buffers.output_buffer,
                 0,
-                &gpu.staging_buffer,
+                &buffers.staging_buffer,
                 0,
                 chunk_bytes,
             );
-            gpu.queue.submit(Some(command_encoder.finish()));
+            ctx.queue.submit(Some(command_encoder.finish()));
 
             let mapped_bytes =
-                map_staging_chunk(&gpu.device, &gpu.staging_buffer, chunk_bytes)?;
+                map_staging_chunk(&ctx.device, &buffers.staging_buffer, chunk_bytes)?;
             let bytes_per_pixel = std::mem::size_of::<u32>();
             for local_index in 0..chunk_len {
                 let byte_start = local_index * pixel_count * bytes_per_pixel;
@@ -201,7 +248,7 @@ impl ShatterTransitionRenderer {
 
         info!(
             backend = "shatter",
-            adapter_fallback = gpu.used_fallback_adapter,
+            adapter_fallback = ctx.used_fallback_adapter,
             requested_size = %request.size(),
             dimensions = %images.dimensions,
             "render complete"
@@ -273,10 +320,7 @@ fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionE
     })
 }
 
-fn init_gpu_pipeline(
-    images: &DecodedImages,
-    request: &TransitionRequest,
-) -> Result<GpuPipeline, TransitionError> {
+fn init_gpu_context() -> Result<GpuContext, TransitionError> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let (adapter, used_fallback_adapter) = request_adapter(&instance)?;
     if used_fallback_adapter {
@@ -293,55 +337,6 @@ fn init_gpu_pipeline(
     .map_err(|error| TransitionError::GpuFailure {
         reason: format!("request_device failed: {error}"),
     })?;
-
-    let from_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("from-buffer"),
-        contents: bytemuck::cast_slice(&images.from_pixels),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-    let to_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("to-buffer"),
-        contents: bytemuck::cast_slice(&images.to_pixels),
-        usage: wgpu::BufferUsages::STORAGE,
-    });
-
-    let total_frames = request.frame_count().get();
-    let out_width = images.dimensions.width();
-    let out_height = images.dimensions.height();
-    let pixel_count = usize::from(out_width) * usize::from(out_height);
-    let bytes_per_frame = pixel_count
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or_else(|| TransitionError::GpuFailure {
-            reason: "frame byte size overflow".to_string(),
-        })?;
-
-    let chunk_frames = compute_chunk_frames(&device, total_frames, bytes_per_frame)?;
-    let output_buffer_size =
-        u64::try_from(chunk_frames * bytes_per_frame).map_err(|_error| {
-            TransitionError::GpuFailure {
-                reason: "output buffer size overflow".to_string(),
-            }
-        })?;
-    let staging_buffer_size = align_to(output_buffer_size, wgpu::MAP_ALIGNMENT);
-
-    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("output-buffer"),
-        size: output_buffer_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging-buffer"),
-        size: staging_buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("params-buffer"),
-        size: std::mem::size_of::<ShatterParams>() as u64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("shatter-bind-group-layout"),
@@ -406,9 +401,73 @@ fn init_gpu_pipeline(
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+
+    Ok(GpuContext {
+        device,
+        queue,
+        pipeline,
+        bind_group_layout,
+        used_fallback_adapter,
+    })
+}
+
+fn create_render_buffers(
+    ctx: &GpuContext,
+    images: &DecodedImages,
+    request: &TransitionRequest,
+) -> Result<RenderBuffers, TransitionError> {
+    let from_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("from-buffer"),
+        contents: bytemuck::cast_slice(&images.from_pixels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let to_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("to-buffer"),
+        contents: bytemuck::cast_slice(&images.to_pixels),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
+    let total_frames = request.frame_count().get();
+    let out_width = images.dimensions.width();
+    let out_height = images.dimensions.height();
+    let pixel_count = usize::from(out_width) * usize::from(out_height);
+    let bytes_per_frame = pixel_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| TransitionError::GpuFailure {
+            reason: "frame byte size overflow".to_string(),
+        })?;
+
+    let chunk_frames = compute_chunk_frames(&ctx.device, total_frames, bytes_per_frame)?;
+    let output_buffer_size =
+        u64::try_from(chunk_frames * bytes_per_frame).map_err(|_error| {
+            TransitionError::GpuFailure {
+                reason: "output buffer size overflow".to_string(),
+            }
+        })?;
+    let staging_buffer_size = align_to(output_buffer_size, wgpu::MAP_ALIGNMENT);
+
+    let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("output-buffer"),
+        size: output_buffer_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let staging_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("staging-buffer"),
+        size: staging_buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("params-buffer"),
+        size: std::mem::size_of::<ShatterParams>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("shatter-bind-group"),
-        layout: &bind_group_layout,
+        layout: &ctx.bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -429,17 +488,13 @@ fn init_gpu_pipeline(
         ],
     });
 
-    Ok(GpuPipeline {
-        device,
-        queue,
-        pipeline,
+    Ok(RenderBuffers {
         bind_group,
         output_buffer,
         staging_buffer,
         params_buffer,
         chunk_frames,
         bytes_per_frame,
-        used_fallback_adapter,
     })
 }
 
