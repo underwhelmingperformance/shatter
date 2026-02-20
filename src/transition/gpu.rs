@@ -313,8 +313,8 @@ impl ShatterTransitionRenderer {
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups(
-                    div_ceil_u32(u32::from(out_width), WORKGROUP_SIZE_X),
-                    div_ceil_u32(u32::from(out_height), WORKGROUP_SIZE_Y),
+                    u32::from(out_width).div_ceil(WORKGROUP_SIZE_X),
+                    u32::from(out_height).div_ceil(WORKGROUP_SIZE_Y),
                     u32::try_from(chunk_len).map_err(|_error| TransitionError::GpuFailure {
                         reason: "dispatch chunk overflow".to_string(),
                     })?,
@@ -474,10 +474,6 @@ fn pack_rgba_to_u32(raw: &[u8]) -> Vec<u32> {
     raw.chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
-}
-
-fn div_ceil_u32(value: u32, divisor: u32) -> u32 {
-    value.div_ceil(divisor)
 }
 
 fn align_to(value: u64, alignment: u64) -> u64 {
