@@ -64,11 +64,12 @@ struct GpuContext {
 }
 
 /// Per-render GPU resources whose sizes depend on the input images and
-/// output dimensions.
+/// output dimensions. Two staging buffers enable overlapping GPU
+/// compute with CPU readback/encoding (double-buffering).
 struct RenderBuffers {
     bind_group: wgpu::BindGroup,
     output_buffer: wgpu::Buffer,
-    staging_buffer: wgpu::Buffer,
+    staging_buffers: [wgpu::Buffer; 2],
     params_buffer: wgpu::Buffer,
     chunk_frames: usize,
     bytes_per_frame: usize,
@@ -156,8 +157,15 @@ impl ShatterTransitionRenderer {
         let workgroups_x = u32::from(out_width).div_ceil(WORKGROUP_SIZE_X);
         let workgroups_y = u32::from(out_height).div_ceil(WORKGROUP_SIZE_Y);
 
+        // Double-buffered dispatch loop: submit chunk N to
+        // staging[N%2], then read back chunk N-1 from the other
+        // staging buffer while the GPU is busy with chunk N.
         progress_set_length!(frames_total);
         let mut frame_start = 0usize;
+        let mut staging_index = 0usize;
+        let mut pending: Option<(usize, usize, u64)> = None; // (staging_idx, chunk_len, chunk_bytes)
+        let bytes_per_pixel = std::mem::size_of::<u32>();
+
         while frame_start < frames_total {
             let chunk_len = (frames_total - frame_start).min(buffers.chunk_frames);
 
@@ -219,16 +227,48 @@ impl ShatterTransitionRenderer {
             command_encoder.copy_buffer_to_buffer(
                 &buffers.output_buffer,
                 0,
-                &buffers.staging_buffer,
+                &buffers.staging_buffers[staging_index],
                 0,
                 chunk_bytes,
             );
             ctx.queue.submit(Some(command_encoder.finish()));
 
-            let mapped_bytes =
-                map_staging_chunk(&ctx.device, &buffers.staging_buffer, chunk_bytes)?;
-            let bytes_per_pixel = std::mem::size_of::<u32>();
-            for local_index in 0..chunk_len {
+            // While the GPU computes chunk N, read back chunk N-1.
+            if let Some((prev_staging, prev_len, prev_bytes)) = pending.take() {
+                let mapped_bytes = map_staging_chunk(
+                    &ctx.device,
+                    &buffers.staging_buffers[prev_staging],
+                    prev_bytes,
+                )?;
+                for local_index in 0..prev_len {
+                    let byte_start = local_index * pixel_count * bytes_per_pixel;
+                    let byte_end = byte_start + pixel_count * bytes_per_pixel;
+                    let mut rgba = mapped_bytes[byte_start..byte_end].to_vec();
+
+                    let mut frame =
+                        gif::Frame::from_rgba_speed(out_width, out_height, &mut rgba, 10);
+                    frame.delay = delay;
+                    frame.dispose = gif::DisposalMethod::Background;
+                    encoder
+                        .write_frame(&frame)
+                        .map_err(|source| TransitionError::GifEncoding { source })?;
+                    progress_inc!();
+                }
+            }
+
+            pending = Some((staging_index, chunk_len, chunk_bytes));
+            staging_index = 1 - staging_index;
+            frame_start += chunk_len;
+        }
+
+        // Flush the final pending chunk.
+        if let Some((prev_staging, prev_len, prev_bytes)) = pending.take() {
+            let mapped_bytes = map_staging_chunk(
+                &ctx.device,
+                &buffers.staging_buffers[prev_staging],
+                prev_bytes,
+            )?;
+            for local_index in 0..prev_len {
                 let byte_start = local_index * pixel_count * bytes_per_pixel;
                 let byte_end = byte_start + pixel_count * bytes_per_pixel;
                 let mut rgba = mapped_bytes[byte_start..byte_end].to_vec();
@@ -242,8 +282,6 @@ impl ShatterTransitionRenderer {
                     .map_err(|source| TransitionError::GifEncoding { source })?;
                 progress_inc!();
             }
-
-            frame_start += chunk_len;
         }
 
         info!(
@@ -452,12 +490,20 @@ fn create_render_buffers(
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let staging_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("staging-buffer"),
-        size: staging_buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    let staging_buffers = [
+        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging-buffer-0"),
+            size: staging_buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }),
+        ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging-buffer-1"),
+            size: staging_buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        }),
+    ];
     let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("params-buffer"),
         size: std::mem::size_of::<ShatterParams>() as u64,
@@ -491,7 +537,7 @@ fn create_render_buffers(
     Ok(RenderBuffers {
         bind_group,
         output_buffer,
-        staging_buffer,
+        staging_buffers,
         params_buffer,
         chunk_frames,
         bytes_per_frame,
