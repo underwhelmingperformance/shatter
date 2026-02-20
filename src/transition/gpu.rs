@@ -27,9 +27,12 @@ struct Params {
     total_frames: u32,
     frame_start: u32,
     chunk_frames: u32,
+    hold_frames: u32,
     seed_lo: u32,
     seed_hi: u32,
     _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 };
 
 @group(0) @binding(0)
@@ -76,6 +79,47 @@ fn hash01_vec2(v: vec2<f32>, seed_lo: u32, seed_hi: u32) -> f32 {
     let x = u32(v.x);
     let y = u32(v.y);
     return hash01_u32(x, y, seed_lo, seed_hi);
+}
+
+fn cell_progress(cell_noise: f32, phase_progress: f32) -> f32 {
+    let edge0 = max(0.0, cell_noise - SMOOTHNESS);
+    let edge1 = min(1.0, cell_noise + SMOOTHNESS);
+    return smoothstep(edge0, edge1, phase_progress);
+}
+
+fn ease_in_out_cubic(x: f32) -> f32 {
+    if (x < 0.5) {
+        return 4.0 * x * x * x;
+    }
+
+    let t = -2.0 * x + 2.0;
+    return 1.0 - (t * t * t) * 0.5;
+}
+
+fn timeline_progress(frame_index: u32) -> f32 {
+    if (params.total_frames <= 1u) {
+        return 1.0;
+    }
+
+    let max_hold = (params.total_frames - 1u) / 2u;
+    let hold = min(params.hold_frames, max_hold);
+    if (frame_index < hold) {
+        return 0.0;
+    }
+
+    let final_transition_frame = params.total_frames - hold - 1u;
+    if (frame_index >= final_transition_frame) {
+        return 1.0;
+    }
+
+    let transition_frames = params.total_frames - (hold * 2u);
+    if (transition_frames <= 1u) {
+        return 1.0;
+    }
+
+    let active_index = frame_index - hold;
+    let linear_progress = f32(active_index) / f32(transition_frames - 1u);
+    return ease_in_out_cubic(linear_progress);
 }
 
 fn fit_sample_from(uv: vec2<f32>) -> vec4<f32> {
@@ -151,45 +195,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixel_index = gid.y * params.out_width + gid.x;
     let frame_index = params.frame_start + gid.z;
 
-    var progress = 1.0;
-    if (params.total_frames > 1u) {
-        progress = f32(frame_index) / f32(params.total_frames - 1u);
-    }
+    let progress = timeline_progress(frame_index);
 
     let uv = vec2<f32>(
         (f32(gid.x) + 0.5) / f32(params.out_width),
         (f32(gid.y) + 0.5) / f32(params.out_height)
     );
 
-    let to_color = fit_sample_to(uv);
-
     // Random-cell reveal inspired by gl-transitions random-square approach.
     let cell = floor(vec2<f32>(GRID_X, GRID_Y) * uv);
     let r = hash01_vec2(cell, params.seed_lo, params.seed_hi);
-    let reveal = smoothstep(r - SMOOTHNESS, r + SMOOTHNESS, progress);
 
-    // Shard displacement from source image.
+    // Shared shard direction used by both phases.
     let center = vec2<f32>(0.5, 0.5);
     let jitter = hash01_vec2(cell + vec2<f32>(31.0, 17.0), params.seed_lo, params.seed_hi);
     let angle = jitter * 6.28318530718;
     let random_dir = vec2<f32>(cos(angle), sin(angle));
     let radial_dir = normalize_safe(uv - center);
     let shard_dir = normalize_safe(radial_dir * 0.7 + random_dir * 0.3);
-    let shard_push = (1.0 - reveal) * progress * (0.18 + 0.35 * r);
-    let from_sample_uv = clamp(uv - shard_dir * shard_push, vec2<f32>(0.0), vec2<f32>(1.0));
-    let from_shard = fit_sample_from(from_sample_uv);
+    let out_index = gid.z * (params.out_width * params.out_height) + pixel_index;
 
-    // Ignore background: if both inputs are transparent, keep transparent.
-    if (from_shard.a <= 0.0 && to_color.a <= 0.0) {
-        let out_index = gid.z * (params.out_width * params.out_height) + pixel_index;
+    // Stage one: shatter the source image outwards.
+    if (progress < 0.5) {
+        let phase_progress = progress * 2.0;
+        let disappear = cell_progress(r, phase_progress);
+        let shard_push = phase_progress * (0.18 + 0.35 * r);
+        let from_sample_uv = clamp(uv - shard_dir * shard_push, vec2<f32>(0.0), vec2<f32>(1.0));
+        let from_shard = fit_sample_from(from_sample_uv);
+        let out_alpha = from_shard.a * (1.0 - disappear);
+
+        if (out_alpha <= 0.0) {
+            out_pixels[out_index] = pack_rgba(vec4<f32>(0.0, 0.0, 0.0, 0.0));
+            return;
+        }
+
+        out_pixels[out_index] = pack_rgba(vec4<f32>(from_shard.rgb, out_alpha));
+        return;
+    }
+
+    // Stage two: shatter the target image inwards.
+    let phase_progress = (progress - 0.5) * 2.0;
+    let appear = cell_progress(r, phase_progress);
+    let shard_pull = (1.0 - phase_progress) * (0.18 + 0.35 * r);
+    let to_sample_uv = clamp(uv - shard_dir * shard_pull, vec2<f32>(0.0), vec2<f32>(1.0));
+    let to_shard = fit_sample_to(to_sample_uv);
+    let out_alpha = to_shard.a * appear * phase_progress;
+
+    if (out_alpha <= 0.0) {
         out_pixels[out_index] = pack_rgba(vec4<f32>(0.0, 0.0, 0.0, 0.0));
         return;
     }
 
-    let out_color = mix(from_shard, to_color, reveal);
-
-    let out_index = gid.z * (params.out_width * params.out_height) + pixel_index;
-    out_pixels[out_index] = pack_rgba(out_color);
+    out_pixels[out_index] = pack_rgba(vec4<f32>(to_shard.rgb, out_alpha));
 }
 "#;
 
@@ -319,7 +376,7 @@ impl ShatterTransitionRenderer {
         });
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params-buffer"),
-            size: 48,
+            size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -444,8 +501,11 @@ impl ShatterTransitionRenderer {
                 u32::try_from(chunk_len).map_err(|_error| TransitionError::GpuFailure {
                     reason: "chunk frame count overflow".to_string(),
                 })?,
+                u32::from(request.hold_frames()),
                 request.seed() as u32,
                 (request.seed() >> 32) as u32,
+                0,
+                0,
                 0,
             ];
             queue.write_buffer(&params_buffer, 0, bytemuck::cast_slice(&params));

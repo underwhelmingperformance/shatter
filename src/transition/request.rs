@@ -12,6 +12,7 @@ pub struct TransitionRequest {
     size: RenderSize,
     frame_count: NonZeroU16,
     fps: NonZeroU16,
+    hold_frames: u16,
     seed: u64,
 }
 
@@ -30,8 +31,10 @@ impl TransitionRequest {
     ///     RenderSize::Fixed(PanelDimensions::new(64, 64).expect("64x64 should be valid")),
     ///     NonZeroU16::new(24).expect("24 is non-zero"),
     ///     NonZeroU16::new(16).expect("16 is non-zero"),
+    ///     2,
     ///     42,
     /// );
+    /// assert_eq!(2, request.hold_frames());
     /// assert_eq!(42, request.seed());
     /// ```
     #[must_use]
@@ -42,6 +45,7 @@ impl TransitionRequest {
         size: RenderSize,
         frame_count: NonZeroU16,
         fps: NonZeroU16,
+        hold_frames: u16,
         seed: u64,
     ) -> Self {
         Self {
@@ -51,6 +55,7 @@ impl TransitionRequest {
             size,
             frame_count,
             fps,
+            hold_frames,
             seed,
         }
     }
@@ -89,6 +94,12 @@ impl TransitionRequest {
     #[must_use]
     pub fn fps(&self) -> NonZeroU16 {
         self.fps
+    }
+
+    /// Returns the number of fully-static hold frames at both start and end.
+    #[must_use]
+    pub fn hold_frames(&self) -> u16 {
+        self.hold_frames
     }
 
     /// Returns the deterministic random seed.

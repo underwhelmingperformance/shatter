@@ -68,10 +68,12 @@ async fn run_with_clients_emits_json_for_render_command() -> anyhow::Result<()> 
         "out.gif",
         "--size",
         "48x32",
-        "--frames",
-        "12",
+        "--duration-seconds",
+        "1.2",
         "--fps",
         "10",
+        "--hold-seconds",
+        "0.3",
         "--seed",
         "99",
     ])?;
@@ -112,6 +114,7 @@ async fn run_with_clients_emits_json_for_render_command() -> anyhow::Result<()> 
     );
     assert_eq!(12, captured_requests[0].frame_count().get());
     assert_eq!(10, captured_requests[0].fps().get());
+    assert_eq!(3, captured_requests[0].hold_frames());
     assert_eq!(99, captured_requests[0].seed());
 
     Ok(())
@@ -150,6 +153,7 @@ async fn run_with_clients_defaults_to_auto_size_mode() -> anyhow::Result<()> {
     let captured_requests = captured_guard.as_slice();
     assert_eq!(1, captured_requests.len());
     assert_eq!(RenderSize::Auto, captured_requests[0].size());
+    assert_eq!(2, captured_requests[0].hold_frames());
 
     Ok(())
 }

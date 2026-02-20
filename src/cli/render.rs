@@ -10,6 +10,9 @@ use tracing::instrument;
 use crate::cli::OutputFormat;
 use crate::{RenderReceipt, RenderSize, TransitionRequest, TransitionService};
 
+pub(crate) const DEFAULT_DURATION_SECONDS: f32 = 1.5;
+pub(crate) const DEFAULT_HOLD_SECONDS: f32 = 0.125;
+
 #[derive(Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum RenderResult {
@@ -36,12 +39,15 @@ pub struct RenderArgs {
     /// Output size strategy: `auto` or `WIDTHxHEIGHT`.
     #[arg(long, default_value = "auto")]
     size: RenderSize,
-    /// Number of frames to generate.
-    #[arg(long, default_value_t = NonZeroU16::new(24).expect("24 is non-zero"))]
-    frames: NonZeroU16,
+    /// Total animation duration in seconds.
+    #[arg(long, default_value_t = DEFAULT_DURATION_SECONDS, value_parser = parse_positive_seconds)]
+    duration_seconds: f32,
     /// Playback frame rate.
     #[arg(long, default_value_t = NonZeroU16::new(16).expect("16 is non-zero"))]
     fps: NonZeroU16,
+    /// Additional static hold time, in seconds, at both the start and end.
+    #[arg(long, default_value_t = DEFAULT_HOLD_SECONDS, value_parser = parse_non_negative_seconds)]
+    hold_seconds: f32,
     /// Seed used to keep the pixel-order deterministic.
     #[arg(long, default_value_t = 0)]
     seed: u64,
@@ -54,8 +60,9 @@ impl Default for RenderArgs {
             to: PathBuf::from("to.png"),
             output: PathBuf::from("out.gif"),
             size: RenderSize::Auto,
-            frames: NonZeroU16::new(24).expect("24 is non-zero"),
+            duration_seconds: DEFAULT_DURATION_SECONDS,
             fps: NonZeroU16::new(16).expect("16 is non-zero"),
+            hold_seconds: DEFAULT_HOLD_SECONDS,
             seed: 0,
         }
     }
@@ -67,8 +74,9 @@ impl RenderArgs {
         to: PathBuf,
         output: PathBuf,
         size: RenderSize,
-        frames: NonZeroU16,
+        duration_seconds: f32,
         fps: NonZeroU16,
+        hold_seconds: f32,
         seed: u64,
     ) -> Self {
         Self {
@@ -76,23 +84,61 @@ impl RenderArgs {
             to,
             output,
             size,
-            frames,
+            duration_seconds,
             fps,
+            hold_seconds,
             seed,
         }
     }
 
     pub(crate) fn to_request(&self) -> TransitionRequest {
+        let frame_count = duration_seconds_to_frame_count(self.duration_seconds, self.fps);
+        let hold_frames = hold_seconds_to_frame_count(self.hold_seconds, self.fps);
         TransitionRequest::new(
             self.from.clone(),
             self.to.clone(),
             self.output.clone(),
             self.size,
-            self.frames,
+            frame_count,
             self.fps,
+            hold_frames,
             self.seed,
         )
     }
+}
+
+pub(crate) fn parse_positive_seconds(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .parse::<f32>()
+        .map_err(|_error| format!("`{raw}` is not a valid seconds value"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err("duration must be a finite value greater than zero".to_string());
+    }
+    Ok(value)
+}
+
+pub(crate) fn parse_non_negative_seconds(raw: &str) -> Result<f32, String> {
+    let value = raw
+        .parse::<f32>()
+        .map_err(|_error| format!("`{raw}` is not a valid seconds value"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(
+            "hold duration must be a finite value greater than or equal to zero".to_string(),
+        );
+    }
+    Ok(value)
+}
+
+fn duration_seconds_to_frame_count(duration_seconds: f32, fps: NonZeroU16) -> NonZeroU16 {
+    let estimated = (duration_seconds * f32::from(fps.get())).round();
+    let clamped = estimated.clamp(1.0, f32::from(u16::MAX));
+    NonZeroU16::new(clamped as u16).expect("clamped frame count must be non-zero")
+}
+
+fn hold_seconds_to_frame_count(hold_seconds: f32, fps: NonZeroU16) -> u16 {
+    let estimated = (hold_seconds * f32::from(fps.get())).round();
+    let clamped = estimated.clamp(0.0, f32::from(u16::MAX));
+    clamped as u16
 }
 
 /// Executes the top-level `render` command.
@@ -155,6 +201,26 @@ mod tests {
         assert_eq!(RenderSize::Auto, request.size());
         assert_eq!(24, request.frame_count().get());
         assert_eq!(16, request.fps().get());
+        assert_eq!(2, request.hold_frames());
         assert_eq!(0, request.seed());
+    }
+
+    #[test]
+    fn to_request_converts_seconds_to_frame_counts() {
+        let args = RenderArgs::new(
+            PathBuf::from("from.png"),
+            PathBuf::from("to.png"),
+            PathBuf::from("out.gif"),
+            RenderSize::Auto,
+            1.2,
+            NonZeroU16::new(10).expect("10 is non-zero"),
+            0.3,
+            9,
+        );
+        let request = args.to_request();
+
+        assert_eq!(12, request.frame_count().get());
+        assert_eq!(3, request.hold_frames());
+        assert_eq!(9, request.seed());
     }
 }

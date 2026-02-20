@@ -4,7 +4,10 @@ use std::path::PathBuf;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::RenderSize;
-use crate::cli::render::RenderArgs;
+use crate::cli::render::{
+    DEFAULT_DURATION_SECONDS, DEFAULT_HOLD_SECONDS, RenderArgs, parse_non_negative_seconds,
+    parse_positive_seconds,
+};
 
 /// Command-line options for the image shatter tool.
 #[derive(Debug, Parser)]
@@ -32,12 +35,15 @@ pub struct Args {
     /// Output size strategy: `auto` or `WIDTHxHEIGHT`.
     #[arg(long, default_value = "auto")]
     size: RenderSize,
-    /// Number of frames to generate.
-    #[arg(long, default_value_t = NonZeroU16::new(24).expect("24 is non-zero"))]
-    frames: NonZeroU16,
+    /// Total animation duration in seconds.
+    #[arg(long, default_value_t = DEFAULT_DURATION_SECONDS, value_parser = parse_positive_seconds)]
+    duration_seconds: f32,
     /// Playback frame rate.
     #[arg(long, default_value_t = NonZeroU16::new(16).expect("16 is non-zero"))]
     fps: NonZeroU16,
+    /// Additional static hold time, in seconds, at both the start and end.
+    #[arg(long, default_value_t = DEFAULT_HOLD_SECONDS, value_parser = parse_non_negative_seconds)]
+    hold_seconds: f32,
     /// Seed used to keep the pixel-order deterministic.
     #[arg(long, default_value_t = 0)]
     seed: u64,
@@ -63,8 +69,9 @@ impl Args {
             to: None,
             output: None,
             size: RenderSize::Auto,
-            frames: NonZeroU16::new(24).expect("24 is non-zero"),
+            duration_seconds: DEFAULT_DURATION_SECONDS,
             fps: NonZeroU16::new(16).expect("16 is non-zero"),
+            hold_seconds: DEFAULT_HOLD_SECONDS,
             seed: 0,
             command: Some(command),
         }
@@ -138,8 +145,9 @@ impl Args {
             self.to.expect("validated above"),
             self.output.expect("validated above"),
             self.size,
-            self.frames,
+            self.duration_seconds,
             self.fps,
+            self.hold_seconds,
             self.seed,
         )))
     }
@@ -203,6 +211,37 @@ mod tests {
         ]);
 
         let error = result.expect_err("invalid size should fail argument parsing");
+        assert_eq!(ErrorKind::ValueValidation, error.kind());
+    }
+
+    #[test]
+    fn parse_rejects_non_positive_duration_seconds() {
+        let result = Args::try_parse_from([
+            "shatter",
+            "render",
+            "one.png",
+            "two.png",
+            "out.gif",
+            "--duration-seconds",
+            "0",
+        ]);
+
+        let error = result.expect_err("zero duration should fail argument parsing");
+        assert_eq!(ErrorKind::ValueValidation, error.kind());
+    }
+
+    #[test]
+    fn parse_rejects_negative_hold_seconds() {
+        let result = Args::try_parse_from([
+            "shatter",
+            "render",
+            "one.png",
+            "two.png",
+            "out.gif",
+            "--hold-seconds=-1",
+        ]);
+
+        let error = result.expect_err("negative hold should fail argument parsing");
         assert_eq!(ErrorKind::ValueValidation, error.kind());
     }
 
