@@ -336,15 +336,11 @@ impl ShatterTransitionRenderer {
             queue.submit(Some(command_encoder.finish()));
 
             let mapped_bytes = map_staging_chunk(&device, &staging_buffer, chunk_bytes)?;
-            let words = bytemuck::cast_slice::<u8, u32>(&mapped_bytes);
+            let bytes_per_pixel = std::mem::size_of::<u32>();
             for local_index in 0..chunk_len {
-                let start = local_index * pixel_count;
-                let end = start + pixel_count;
-                let frame_words = &words[start..end];
-                let mut rgba = Vec::with_capacity(pixel_count * 4);
-                for &packed in frame_words {
-                    rgba.extend_from_slice(&packed.to_le_bytes());
-                }
+                let byte_start = local_index * pixel_count * bytes_per_pixel;
+                let byte_end = byte_start + pixel_count * bytes_per_pixel;
+                let mut rgba = mapped_bytes[byte_start..byte_end].to_vec();
 
                 let mut frame = gif::Frame::from_rgba_speed(out_width, out_height, &mut rgba, 10);
                 frame.delay = delay;
