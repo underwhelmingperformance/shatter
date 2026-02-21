@@ -29,20 +29,26 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Checkout PR branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin ${{ github.head_ref }}
+          git checkout ${{ github.head_ref }}
+
       - name: Install GPU drivers
         run: |
           sudo apt-get update
           sudo apt-get install -y mesa-vulkan-drivers
 
       - name: Rebuild demo GIF
+        id: gif-diff
         run: |
           old_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
-          cargo run -- images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --size 1024x1024
+          target/debug/shatter images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --size 1024x1024
           new_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
           if [ "$old_hash" != "$new_hash" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
-        id: gif-diff
 
       - name: Fail if GIF is outdated on main
         if: steps.gif-diff.outputs.changed == 'true' && github.ref == 'refs/heads/main'
@@ -53,11 +59,6 @@ jobs:
       - name: Commit and push updated GIF
         if: steps.gif-diff.outputs.changed == 'true' && github.event_name == 'pull_request'
         run: |
-          git fetch --depth=1 origin ${{ github.head_ref }}
-          git checkout ${{ github.head_ref }}
-          cp ramenbeer.gif ramenbeer.gif.new
-          git checkout -- ramenbeer.gif
-          mv ramenbeer.gif.new ramenbeer.gif
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ramenbeer.gif
