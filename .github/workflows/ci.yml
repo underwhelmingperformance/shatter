@@ -44,8 +44,10 @@ jobs:
         id: gif-diff
         run: |
           old_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
+          echo "Old hash: $old_hash"
           target/debug/shatter images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --size 1024x1024
           new_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
+          echo "New hash: $new_hash"
           if [ "$old_hash" != "$new_hash" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
