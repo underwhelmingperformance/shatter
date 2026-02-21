@@ -120,11 +120,7 @@ pub(super) struct ShatterTransitionRenderer {
 
 impl std::fmt::Debug for ShatterTransitionRenderer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let initialized = self
-            .gpu
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false);
+        let initialized = self.gpu.lock().map(|g| g.is_some()).unwrap_or(false);
         f.debug_struct("ShatterTransitionRenderer")
             .field("gpu_initialized", &initialized)
             .finish()
@@ -145,10 +141,7 @@ impl ShatterTransitionRenderer {
     }
 
     fn ensure_gpu_context(&self) -> Result<Arc<GpuContext>, TransitionError> {
-        let mut guard = self
-            .gpu
-            .lock()
-            .expect("GPU context lock not poisoned");
+        let mut guard = self.gpu.lock().expect("GPU context lock not poisoned");
         if guard.is_none() {
             *guard = Some(Arc::new(init_gpu_context()?));
         }
@@ -169,13 +162,12 @@ impl ShatterTransitionRenderer {
         request: &TransitionRequest,
     ) -> Result<RenderReceipt, TransitionError> {
         let images = load_images(request)?;
-        let mut output_file =
-            std::fs::File::create(request.output_path()).map_err(|source| {
-                TransitionError::OutputIo {
-                    path: request.output_path().to_path_buf(),
-                    source,
-                }
-            })?;
+        let mut output_file = std::fs::File::create(request.output_path()).map_err(|source| {
+            TransitionError::OutputIo {
+                path: request.output_path().to_path_buf(),
+                source,
+            }
+        })?;
         let frames_total = usize::from(request.frame_count().get());
         progress_set_length!(frames_total);
         self.render_gif(
@@ -217,10 +209,15 @@ impl ShatterTransitionRenderer {
         let delay = fps_to_delay_centiseconds(options.fps);
         let frames_total = usize::from(total_frames);
         let words_per_frame = pixel_count.div_ceil(4);
-        let mut chunk_encoder =
-            ChunkEncoder::new(&ctx.device, writer, out_width, out_height, delay, pixel_count)?;
-        let quantize_workgroups_x =
-            (words_per_frame as u32).div_ceil(QUANTIZE_WORKGROUP_SIZE);
+        let mut chunk_encoder = ChunkEncoder::new(
+            &ctx.device,
+            writer,
+            out_width,
+            out_height,
+            delay,
+            pixel_count,
+        )?;
+        let quantize_workgroups_x = (words_per_frame as u32).div_ceil(QUANTIZE_WORKGROUP_SIZE);
         let grid_x = DEFAULT_GRID_X;
         let grid_y = DEFAULT_GRID_Y;
         let instance_count = grid_x * grid_y;
@@ -254,8 +251,7 @@ impl ShatterTransitionRenderer {
                     to_width: u32::from(images.to_width),
                     to_height: u32::from(images.to_height),
                     total_frames: u32::from(total_frames),
-                    frame_start: u32::try_from(global_frame)
-                        .expect("frame index fits u32"),
+                    frame_start: u32::try_from(global_frame).expect("frame index fits u32"),
                     chunk_frames: 0,
                     hold_frames: u32::from(options.hold_frames),
                     seed_lo: options.seed as u32,
@@ -291,32 +287,28 @@ impl ShatterTransitionRenderer {
                     });
 
             for local_frame in 0..chunk_len {
-                let shatter_offset =
-                    (local_frame as u32) * buffers.shatter_param_stride;
-                let quantize_offset =
-                    (local_frame as u32) * buffers.quantize_param_stride;
+                let shatter_offset = (local_frame as u32) * buffers.shatter_param_stride;
+                let quantize_offset = (local_frame as u32) * buffers.quantize_param_stride;
 
                 // Render pass: draw instanced quads.
                 {
                     let mut render_pass =
                         command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             label: Some("shatter-render-pass"),
-                            color_attachments: &[Some(
-                                wgpu::RenderPassColorAttachment {
-                                    view: &buffers.render_view,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                                            r: 0.0,
-                                            g: 0.0,
-                                            b: 0.0,
-                                            a: 0.0,
-                                        }),
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &buffers.render_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 0.0,
+                                    }),
+                                    store: wgpu::StoreOp::Store,
                                 },
-                            )],
+                                depth_slice: None,
+                            })],
                             depth_stencil_attachment: Some(
                                 wgpu::RenderPassDepthStencilAttachment {
                                     view: &buffers.depth_view,
@@ -331,11 +323,7 @@ impl ShatterTransitionRenderer {
                             occlusion_query_set: None,
                         });
                     render_pass.set_pipeline(&ctx.shatter_pipeline);
-                    render_pass.set_bind_group(
-                        0,
-                        &buffers.shatter_bind_group,
-                        &[shatter_offset],
-                    );
+                    render_pass.set_bind_group(0, &buffers.shatter_bind_group, &[shatter_offset]);
                     render_pass.draw(0..VERTICES_PER_CELL, 0..instance_count);
                 }
 
@@ -347,11 +335,7 @@ impl ShatterTransitionRenderer {
                             timestamp_writes: None,
                         });
                     pass.set_pipeline(&ctx.quantize_pipeline);
-                    pass.set_bind_group(
-                        0,
-                        &buffers.quantize_bind_group,
-                        &[quantize_offset],
-                    );
+                    pass.set_bind_group(0, &buffers.quantize_bind_group, &[quantize_offset]);
                     pass.dispatch_workgroups(quantize_workgroups_x, 1, 1);
                 }
             }
@@ -425,11 +409,8 @@ impl<'a, W: Write> ChunkEncoder<'a, W> {
         delay: u16,
         pixel_count: usize,
     ) -> Result<Self, TransitionError> {
-        let mut encoder = gif::Encoder::new(writer, out_width, out_height, &[])
-            ?;
-        encoder
-            .set_repeat(gif::Repeat::Infinite)
-            ?;
+        let mut encoder = gif::Encoder::new(writer, out_width, out_height, &[])?;
+        encoder.set_repeat(gif::Repeat::Infinite)?;
         Ok(Self {
             device,
             encoder,
@@ -467,9 +448,7 @@ impl<'a, W: Write> ChunkEncoder<'a, W> {
             );
             frame.delay = self.delay;
             frame.dispose = gif::DisposalMethod::Background;
-            self.encoder
-                .write_frame(&frame)
-                ?;
+            self.encoder.write_frame(&frame)?;
         }
         Ok(())
     }
@@ -517,8 +496,8 @@ fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionE
         crate::RenderSize::Auto => None,
     };
 
-    let from_image = load_image(request.from_path(), fit_to)
-        .map_err(|source| TransitionError::SourceImage {
+    let from_image =
+        load_image(request.from_path(), fit_to).map_err(|source| TransitionError::SourceImage {
             path: request.from_path().to_path_buf(),
             source,
         })?;
@@ -589,8 +568,7 @@ fn init_gpu_context() -> Result<GpuContext, TransitionError> {
         required_limits: wgpu::Limits::default(),
         memory_hints: wgpu::MemoryHints::Performance,
         trace: wgpu::Trace::Off,
-    }))
-?;
+    }))?;
 
     // --- Shatter render pipeline ---
     let shatter_bind_group_layout =
@@ -602,52 +580,50 @@ fn init_gpu_context() -> Result<GpuContext, TransitionError> {
                 uniform_entry(2, wgpu::ShaderStages::VERTEX_FRAGMENT, true),
             ],
         });
-    let shatter_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("shatter-pipeline-layout"),
-            bind_group_layouts: &[&shatter_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+    let shatter_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shatter-pipeline-layout"),
+        bind_group_layouts: &[&shatter_bind_group_layout],
+        push_constant_ranges: &[],
+    });
     let shatter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("shatter-shader"),
         source: wgpu::ShaderSource::Wgsl(SHATTER_SHADER.into()),
     });
-    let shatter_pipeline =
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shatter-pipeline"),
-            layout: Some(&shatter_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shatter_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shatter_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+    let shatter_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shatter-pipeline"),
+        layout: Some(&shatter_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shatter_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shatter_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
 
     // --- Quantize pipeline ---
     let quantize_bind_group_layout =
@@ -659,12 +635,11 @@ fn init_gpu_context() -> Result<GpuContext, TransitionError> {
                 uniform_entry(2, wgpu::ShaderStages::COMPUTE, true),
             ],
         });
-    let quantize_pipeline_layout =
-        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("quantize-pipeline-layout"),
-            bind_group_layouts: &[&quantize_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+    let quantize_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("quantize-pipeline-layout"),
+        bind_group_layouts: &[&quantize_bind_group_layout],
+        push_constant_ranges: &[],
+    });
     let quantize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("quantize-shader"),
         source: wgpu::ShaderSource::Wgsl(QUANTIZE_SHADER.into()),
@@ -945,9 +920,7 @@ fn create_render_buffers(
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &shatter_params_buffer,
                     offset: 0,
-                    size: std::num::NonZeroU64::new(
-                        std::mem::size_of::<ShatterParams>() as u64,
-                    ),
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<ShatterParams>() as u64),
                 }),
             },
         ],
@@ -970,9 +943,7 @@ fn create_render_buffers(
                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &quantize_params_buffer,
                     offset: 0,
-                    size: std::num::NonZeroU64::new(
-                        std::mem::size_of::<QuantizeParams>() as u64,
-                    ),
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<QuantizeParams>() as u64),
                 }),
             },
         ],

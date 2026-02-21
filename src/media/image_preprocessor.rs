@@ -63,8 +63,7 @@ pub(crate) fn decode_svg(
     fit_to: Option<PanelDimensions>,
 ) -> Result<image::RgbaImage, ImagePreparationError> {
     let options = usvg::Options::default();
-    let tree =
-        usvg::Tree::from_data(bytes, &options).map_err(ImagePreparationError::SvgParse)?;
+    let tree = usvg::Tree::from_data(bytes, &options).map_err(ImagePreparationError::SvgParse)?;
     let svg_size = tree.size();
 
     let (width, height, transform) = match fit_to {
@@ -87,11 +86,8 @@ pub(crate) fn decode_svg(
         }
     };
 
-    let mut pixmap =
-        tiny_skia::Pixmap::new(width, height).ok_or(ImagePreparationError::SvgPixmapAlloc {
-            width,
-            height,
-        })?;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or(ImagePreparationError::SvgPixmapAlloc { width, height })?;
     let mut pixmap_mut = pixmap.as_mut();
     resvg::render(&tree, transform, &mut pixmap_mut);
 
@@ -229,6 +225,9 @@ mod tests {
     fn unknown_bytes_report_unknown_format() {
         let bytes = [0x00, 0x01, 0x02, 0x03];
 
-        assert_matches!(decode_raster(&bytes), Err(ImagePreparationError::UnknownFormat(_)));
+        assert_matches!(
+            decode_raster(&bytes),
+            Err(ImagePreparationError::UnknownFormat(_))
+        );
     }
 }
