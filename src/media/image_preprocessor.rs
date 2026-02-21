@@ -6,6 +6,8 @@ use image::DynamicImage;
 use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
+use super::PanelDimensions;
+
 /// Errors returned while decoding and normalising input images.
 #[derive(Debug, Error)]
 pub enum ImagePreparationError {
@@ -54,14 +56,36 @@ pub(crate) fn decode_raster(bytes: &[u8]) -> Result<image::RgbaImage, ImagePrepa
     Ok(oriented.to_rgba8())
 }
 
-/// Decodes an SVG image from raw bytes.
-pub(crate) fn decode_svg(bytes: &[u8]) -> Result<image::RgbaImage, ImagePreparationError> {
+/// Decodes an SVG image from raw bytes, optionally rasterising at a target
+/// size.
+pub(crate) fn decode_svg(
+    bytes: &[u8],
+    fit_to: Option<PanelDimensions>,
+) -> Result<image::RgbaImage, ImagePreparationError> {
     let options = usvg::Options::default();
     let tree =
         usvg::Tree::from_data(bytes, &options).map_err(ImagePreparationError::SvgParse)?;
-    let int_size = tree.size().to_int_size();
-    let width = int_size.width();
-    let height = int_size.height();
+    let svg_size = tree.size();
+
+    let (width, height, transform) = match fit_to {
+        Some(target) => {
+            let scale = f32::min(
+                f32::from(target.width()) / svg_size.width(),
+                f32::from(target.height()) / svg_size.height(),
+            );
+            let w = (svg_size.width() * scale).round().max(1.0) as u32;
+            let h = (svg_size.height() * scale).round().max(1.0) as u32;
+            (w, h, tiny_skia::Transform::from_scale(scale, scale))
+        }
+        None => {
+            let int_size = svg_size.to_int_size();
+            (
+                int_size.width(),
+                int_size.height(),
+                tiny_skia::Transform::default(),
+            )
+        }
+    };
 
     let mut pixmap =
         tiny_skia::Pixmap::new(width, height).ok_or(ImagePreparationError::SvgPixmapAlloc {
@@ -69,7 +93,7 @@ pub(crate) fn decode_svg(bytes: &[u8]) -> Result<image::RgbaImage, ImagePreparat
             height,
         })?;
     let mut pixmap_mut = pixmap.as_mut();
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap_mut);
+    resvg::render(&tree, transform, &mut pixmap_mut);
 
     let rgba = pixmap.take_demultiplied();
     image::RgbaImage::from_raw(width, height, rgba)
@@ -172,13 +196,31 @@ mod tests {
     fn rasterises_svg() -> Result<(), Box<dyn std::error::Error>> {
         let svg = svg_filled_rect(3, 2, "#112233");
 
-        let decoded = decode_svg(svg.as_bytes())?;
+        let decoded = decode_svg(svg.as_bytes(), None)?;
 
         assert_eq!(3, decoded.width());
         assert_eq!(2, decoded.height());
         assert_eq!(
             image::Rgba([0x11, 0x22, 0x33, 0xFF]),
             *decoded.get_pixel(1, 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rasterises_svg_at_target_size() -> Result<(), Box<dyn std::error::Error>> {
+        let svg = svg_filled_rect(10, 5, "#AABBCC");
+        let target = PanelDimensions::new(100, 100).expect("100x100 should be valid");
+
+        let decoded = decode_svg(svg.as_bytes(), Some(target))?;
+
+        // 10x5 SVG fitted into 100x100: scale = min(10, 20) = 10.
+        // Rasterised at 100x50.
+        assert_eq!(100, decoded.width());
+        assert_eq!(50, decoded.height());
+        assert_eq!(
+            image::Rgba([0xAA, 0xBB, 0xCC, 0xFF]),
+            *decoded.get_pixel(50, 25)
         );
         Ok(())
     }
