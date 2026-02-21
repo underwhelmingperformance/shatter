@@ -8,7 +8,7 @@ use serde::Serialize;
 use tracing::instrument;
 
 use crate::cli::OutputFormat;
-use crate::{RenderReceipt, RenderSize, TransitionRequest, TransitionService};
+use crate::{RenderParams, RenderReceipt, RenderSize, TransitionRequest, TransitionService};
 
 pub(crate) const DEFAULT_DURATION_SECONDS: f32 = 1.5;
 pub(crate) const DEFAULT_HOLD_SECONDS: f32 = 0.125;
@@ -29,28 +29,28 @@ enum RenderResult {
 pub struct RenderArgs {
     /// Path to the source image at the start of the animation.
     #[arg(value_name = "FROM")]
-    from: PathBuf,
+    pub(crate) from: PathBuf,
     /// Path to the target image revealed by the transition.
     #[arg(value_name = "TO")]
-    to: PathBuf,
+    pub(crate) to: PathBuf,
     /// Output path for the rendered GIF.
     #[arg(value_name = "OUTPUT")]
-    output: PathBuf,
+    pub(crate) output: PathBuf,
     /// Output size strategy: `auto` or `WIDTHxHEIGHT`.
     #[arg(long, default_value = "auto")]
-    size: RenderSize,
+    pub(crate) size: RenderSize,
     /// Total animation duration in seconds.
     #[arg(long, default_value_t = DEFAULT_DURATION_SECONDS, value_parser = parse_positive_seconds)]
-    duration_seconds: f32,
+    pub(crate) duration_seconds: f32,
     /// Playback frame rate.
     #[arg(long, default_value_t = NonZeroU16::new(16).expect("16 is non-zero"))]
-    fps: NonZeroU16,
+    pub(crate) fps: NonZeroU16,
     /// Additional static hold time, in seconds, at both the start and end.
     #[arg(long, default_value_t = DEFAULT_HOLD_SECONDS, value_parser = parse_non_negative_seconds)]
-    hold_seconds: f32,
+    pub(crate) hold_seconds: f32,
     /// Seed used to keep the pixel-order deterministic.
     #[arg(long, default_value_t = 0)]
-    seed: u64,
+    pub(crate) seed: u64,
 }
 
 impl Default for RenderArgs {
@@ -69,28 +69,6 @@ impl Default for RenderArgs {
 }
 
 impl RenderArgs {
-    pub(crate) fn new(
-        from: PathBuf,
-        to: PathBuf,
-        output: PathBuf,
-        size: RenderSize,
-        duration_seconds: f32,
-        fps: NonZeroU16,
-        hold_seconds: f32,
-        seed: u64,
-    ) -> Self {
-        Self {
-            from,
-            to,
-            output,
-            size,
-            duration_seconds,
-            fps,
-            hold_seconds,
-            seed,
-        }
-    }
-
     pub(crate) fn to_request(&self) -> TransitionRequest {
         let frame_count = duration_seconds_to_frame_count(self.duration_seconds, self.fps);
         let hold_frames = hold_seconds_to_frame_count(self.hold_seconds, self.fps);
@@ -98,11 +76,13 @@ impl RenderArgs {
             self.from.clone(),
             self.to.clone(),
             self.output.clone(),
-            self.size,
-            frame_count,
-            self.fps,
-            hold_frames,
-            self.seed,
+            RenderParams {
+                size: self.size,
+                frame_count,
+                fps: self.fps,
+                hold_frames,
+                seed: self.seed,
+            },
         )
     }
 }
@@ -207,16 +187,13 @@ mod tests {
 
     #[test]
     fn to_request_converts_seconds_to_frame_counts() {
-        let args = RenderArgs::new(
-            PathBuf::from("from.png"),
-            PathBuf::from("to.png"),
-            PathBuf::from("out.gif"),
-            RenderSize::Auto,
-            1.2,
-            NonZeroU16::new(10).expect("10 is non-zero"),
-            0.3,
-            9,
-        );
+        let args = RenderArgs {
+            duration_seconds: 1.2,
+            fps: NonZeroU16::new(10).expect("10 is non-zero"),
+            hold_seconds: 0.3,
+            seed: 9,
+            ..Default::default()
+        };
         let request = args.to_request();
 
         assert_eq!(12, request.frame_count().get());

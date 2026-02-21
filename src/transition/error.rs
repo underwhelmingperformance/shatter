@@ -15,22 +15,49 @@ pub enum TransitionError {
         /// Underlying decode or transformation failure.
         source: ImagePreparationError,
     },
-    /// GPU initialisation is unavailable on this host.
-    #[error("gpu backend is unavailable: {reason}")]
+    /// No GPU adapter could be acquired.
+    #[error("no GPU adapter available")]
     GpuUnavailable {
-        /// Human-readable reason.
-        reason: String,
+        #[from]
+        source: wgpu::RequestAdapterError,
     },
-    /// GPU render path failed.
-    #[error("gpu render failed: {reason}")]
-    GpuFailure {
-        /// Human-readable reason.
-        reason: String,
+    /// GPU device creation failed.
+    #[error("failed to initialise GPU device")]
+    DeviceInit {
+        #[from]
+        source: wgpu::RequestDeviceError,
+    },
+    /// Input image dimensions exceed what the GPU device supports.
+    #[error(
+        "image dimension {actual} exceeds GPU limit of {max}; use --size to downscale"
+    )]
+    ImageTooLarge {
+        /// Largest dimension across all input/output textures.
+        actual: u32,
+        /// Maximum texture dimension supported by the device.
+        max: u32,
+    },
+    /// Image requires more compute workgroups than the device supports.
+    #[error(
+        "image requires {required} compute workgroups but device supports {max}; \
+         use --size to downscale"
+    )]
+    WorkgroupLimitExceeded {
+        /// Workgroups needed for this image.
+        required: u32,
+        /// Device workgroup-per-dimension limit.
+        max: u32,
+    },
+    /// A GPU runtime operation (buffer mapping, device poll) failed.
+    #[error("GPU operation failed")]
+    GpuRuntime {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     /// GIF encoding failed.
     #[error("failed to encode transition gif")]
     GifEncoding {
-        /// Underlying GIF encoding failure.
+        #[from]
         source: gif::EncodingError,
     },
     /// Output file write failed.

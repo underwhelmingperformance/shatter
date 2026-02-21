@@ -11,5 +11,6 @@ pub use cli::{Args, Command, LogLevel, OutputFormat, RenderArgs};
 pub use media::{PanelDimensions, PanelDimensionsParseError, RenderSize, RenderSizeParseError};
 pub use terminal::TerminalClient;
 pub use transition::{
-    RealTransitionService, RenderReceipt, TransitionError, TransitionRequest, TransitionService,
+    RealTransitionService, RenderParams, RenderReceipt, TransitionError, TransitionRequest,
+    TransitionService,
 };
