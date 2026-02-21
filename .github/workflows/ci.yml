@@ -55,8 +55,13 @@ jobs:
       - name: Commit and push updated GIF
         if: steps.gif-diff.outputs.changed == 'true' && github.event_name == 'pull_request'
         run: |
+          git fetch --depth=1 origin ${{ github.head_ref }}
+          git checkout ${{ github.head_ref }}
+          cp ramenbeer.gif ramenbeer.gif.new
+          git checkout -- ramenbeer.gif
+          mv ramenbeer.gif.new ramenbeer.gif
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ramenbeer.gif
           git commit -m "Rebuild demo GIF"
-          git push origin HEAD:${{ github.head_ref }}
+          git push origin ${{ github.head_ref }}
