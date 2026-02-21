@@ -53,9 +53,7 @@ pub enum TransitionError {
         source: wgpu::RequestDeviceError,
     },
     /// Input image dimensions exceed what the GPU device supports.
-    #[error(
-        "image dimension {actual} exceeds GPU limit of {max}; use --size to downscale"
-    )]
+    #[error("image dimension {actual} exceeds GPU limit of {max}; use --size to downscale")]
     ImageTooLarge {
         /// Largest dimension across all input/output textures.
         actual: u32,
