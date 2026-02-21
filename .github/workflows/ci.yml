@@ -15,6 +15,8 @@ jobs:
   build-and-test:
     name: Build and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -26,3 +28,77 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
+
+      - name: Install GPU drivers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: Rebuild demo GIF
+        id: gif-diff
+        run: |
+          old_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
+          old_size=$(wc -c < ramenbeer.gif)
+          echo "Committed GIF: hash=$old_hash size=$old_size"
+          target/debug/shatter images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --duration-seconds 10 --size 1024x1024
+          new_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
+          new_size=$(wc -c < ramenbeer.gif)
+          echo "Regenerated GIF: hash=$new_hash size=$new_size"
+          if [ "$old_hash" != "$new_hash" ]; then
+            echo "GIF content changed — will update"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "GIF is already up to date"
+          fi
+
+      - name: Fail if GIF is outdated on main
+        if: steps.gif-diff.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          echo "::error::ramenbeer.gif is out of date. Please update it in a pull request."
+          exit 1
+
+      - name: Commit and push updated GIF
+        if: steps.gif-diff.outputs.changed == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const content = fs.readFileSync('ramenbeer.gif');
+            const { owner, repo } = context.repo;
+            const branch = context.payload.pull_request.head.ref;
+
+            const blob = await github.rest.git.createBlob({
+              owner, repo,
+              content: content.toString('base64'),
+              encoding: 'base64',
+            });
+
+            const ref = await github.rest.git.getRef({
+              owner, repo,
+              ref: `heads/${branch}`,
+            });
+            const parentSha = ref.data.object.sha;
+
+            const parentCommit = await github.rest.git.getCommit({
+              owner, repo,
+              commit_sha: parentSha,
+            });
+
+            const tree = await github.rest.git.createTree({
+              owner, repo,
+              base_tree: parentCommit.data.tree.sha,
+              tree: [{ path: 'ramenbeer.gif', mode: '100644', type: 'blob', sha: blob.data.sha }],
+            });
+
+            const commit = await github.rest.git.createCommit({
+              owner, repo,
+              message: 'Rebuild demo GIF',
+              tree: tree.data.sha,
+              parents: [parentSha],
+            });
+
+            await github.rest.git.updateRef({
+              owner, repo,
+              ref: `heads/${branch}`,
+              sha: commit.data.sha,
+            });
