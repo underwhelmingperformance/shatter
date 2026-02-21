@@ -1093,13 +1093,16 @@ fn align_to(value: u64, alignment: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    use std::path::Path;
 
     use assert_matches::assert_matches;
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    const QUANTIZED_R_VALUES: [u8; R_LEVELS as usize] = [0, 51, 102, 153, 204, 255];
+    const QUANTIZED_G_VALUES: [u8; G_LEVELS as usize] = [0, 42, 85, 127, 170, 212, 255];
+    const QUANTIZED_B_VALUES: [u8; B_LEVELS as usize] = [0, 51, 102, 153, 204, 255];
 
     #[test]
     fn align_to_rounds_up() {
@@ -1120,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn render_produces_distinct_frames_across_chunk() -> Result<(), Box<dyn std::error::Error>> {
+    fn render_produces_expected_frames_across_chunk() -> Result<(), Box<dyn std::error::Error>> {
         let (width, height): (u16, u16) = (32, 32);
         let pixel_count = usize::from(width) * usize::from(height);
 
@@ -1129,14 +1132,17 @@ mod tests {
         for y in 0..usize::from(height) {
             for x in 0..usize::from(width) {
                 let i = (y * usize::from(width) + x) * 4;
-                from_pixels[i] = (x * 8) as u8;
-                from_pixels[i + 1] = (y * 8) as u8;
-                from_pixels[i + 2] = 128;
+                from_pixels[i] = QUANTIZED_R_VALUES[x % QUANTIZED_R_VALUES.len()];
+                from_pixels[i + 1] = QUANTIZED_G_VALUES[y % QUANTIZED_G_VALUES.len()];
+                from_pixels[i + 2] = QUANTIZED_B_VALUES[(x + y) % QUANTIZED_B_VALUES.len()];
                 from_pixels[i + 3] = 255;
 
-                to_pixels[i] = (255 - x * 8) as u8;
-                to_pixels[i + 1] = (255 - y * 8) as u8;
-                to_pixels[i + 2] = 64;
+                to_pixels[i] = QUANTIZED_R_VALUES
+                    [QUANTIZED_R_VALUES.len() - 1 - (x % QUANTIZED_R_VALUES.len())];
+                to_pixels[i + 1] = QUANTIZED_G_VALUES
+                    [QUANTIZED_G_VALUES.len() - 1 - (y % QUANTIZED_G_VALUES.len())];
+                to_pixels[i + 2] = QUANTIZED_B_VALUES
+                    [QUANTIZED_B_VALUES.len() - 1 - ((x + y) % QUANTIZED_B_VALUES.len())];
                 to_pixels[i + 3] = 255;
             }
         }
@@ -1156,7 +1162,7 @@ mod tests {
         let options = RenderGifOptions {
             total_frames: 4,
             fps: 10,
-            hold_frames: 0,
+            hold_frames: 1,
             seed: 42,
         };
 
@@ -1181,19 +1187,140 @@ mod tests {
         )?;
         assert_eq!(4, chunk_frames);
 
-        // Decode and hash each frame.
+        let frames = decode_indexed_frames(&gif_buf)?;
+        let expected_from = quantize_rgba_pixels(&images.from_pixels);
+        let expected_to = quantize_rgba_pixels(&images.to_pixels);
+        let expected_frames = vec![
+            expected_from.clone(),
+            expected_from,
+            expected_to.clone(),
+            expected_to,
+        ];
+        assert_eq!(expected_frames, frames);
+        Ok(())
+    }
+
+    #[test]
+    fn try_image_dimension_u16_returns_typed_error_for_overflow() {
+        let overflow = u32::from(u16::MAX) + 1;
+        let result = try_image_dimension_u16(Path::new("from.png"), "width", overflow);
+
+        assert_matches!(
+            result,
+            Err(TransitionError::InputImageDimensionTooLarge { path, axis, actual, max })
+                if path == Path::new("from.png")
+                    && axis == "width"
+                    && actual == overflow
+                    && max == u32::from(u16::MAX)
+        );
+    }
+
+    #[test]
+    fn try_panel_dimensions_returns_typed_error_for_zero_dimensions() {
+        let result = try_panel_dimensions(Path::new("from.png"), 0, 32);
+
+        assert_matches!(
+            result,
+            Err(TransitionError::InvalidImageDimensions { path, width, height })
+                if path == Path::new("from.png")
+                    && width == 0
+                    && height == 32
+        );
+    }
+
+    #[test]
+    fn create_render_buffers_rejects_image_too_large() -> Result<(), Box<dyn std::error::Error>> {
+        let renderer = ShatterTransitionRenderer::new();
+        let ctx = match renderer.ensure_gpu_context() {
+            Ok(ctx) => ctx,
+            Err(TransitionError::GpuUnavailable { .. }) => return Ok(()),
+            Err(error) => return Err(Box::new(error)),
+        };
+
+        let max_dim = ctx.device.limits().max_texture_dimension_2d;
+        let oversized_u32 = match max_dim.checked_add(1) {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+        let oversized = match u16::try_from(oversized_u32) {
+            Ok(value) => value,
+            Err(_error) => return Ok(()),
+        };
+
+        let images = DecodedImages {
+            from_pixels: vec![0u8; usize::from(oversized) * 4],
+            to_pixels: vec![0u8; 4],
+            from_width: oversized,
+            from_height: 1,
+            to_width: 1,
+            to_height: 1,
+            dimensions: PanelDimensions::new(1, 1).expect("1x1 dimensions are non-zero"),
+        };
+
+        let result = create_render_buffers(&ctx, &images, 1);
+        assert_matches!(
+            result.as_ref().map(|_buffers| ()),
+            Err(TransitionError::ImageTooLarge { actual, max })
+                if *actual == oversized_u32 && *max == max_dim
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_chunk_frames_rejects_excess_workgroups() -> Result<(), Box<dyn std::error::Error>> {
+        let renderer = ShatterTransitionRenderer::new();
+        let ctx = match renderer.ensure_gpu_context() {
+            Ok(ctx) => ctx,
+            Err(TransitionError::GpuUnavailable { .. }) => return Ok(()),
+            Err(error) => return Err(Box::new(error)),
+        };
+
+        let max_workgroups = ctx.device.limits().max_compute_workgroups_per_dimension;
+        let required = match max_workgroups.checked_add(1) {
+            Some(value) => value,
+            None => return Ok(()),
+        };
+
+        let result = compute_chunk_frames(&ctx.device, 1, 4, required);
+        assert_matches!(
+            result,
+            Err(TransitionError::WorkgroupLimitExceeded { required: actual_required, max })
+                if actual_required == required && max == max_workgroups
+        );
+        Ok(())
+    }
+
+    fn decode_indexed_frames(gif_bytes: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
         let mut decoder = gif::DecodeOptions::new();
         decoder.set_color_output(gif::ColorOutput::Indexed);
-        let mut reader = decoder.read_info(&gif_buf[..])?;
-        let mut hashes = Vec::new();
+        let mut reader = decoder.read_info(gif_bytes)?;
+        let mut frames = Vec::new();
         while let Some(frame) = reader.read_next_frame()? {
-            let mut hasher = DefaultHasher::new();
-            frame.buffer.hash(&mut hasher);
-            hashes.push(hasher.finish());
+            frames.push(frame.buffer.to_vec());
+        }
+        Ok(frames)
+    }
+
+    fn quantize_rgba_pixels(pixels: &[u8]) -> Vec<u8> {
+        pixels
+            .chunks_exact(4)
+            .map(|pixel| quantize_rgba(pixel[0], pixel[1], pixel[2], pixel[3]))
+            .collect()
+    }
+
+    fn quantize_rgba(r: u8, g: u8, b: u8, a: u8) -> u8 {
+        if a < 128 {
+            return TRANSPARENT_INDEX;
         }
 
-        let diffs: Vec<_> = hashes.windows(2).map(|w| w[0] != w[1]).collect();
-        assert_eq!(vec![true, true, true], diffs);
-        Ok(())
+        let ri = quantize_channel(r, R_LEVELS);
+        let gi = quantize_channel(g, G_LEVELS);
+        let bi = quantize_channel(b, B_LEVELS);
+        (ri * G_LEVELS * B_LEVELS + gi * B_LEVELS + bi) as u8
+    }
+
+    fn quantize_channel(component: u8, levels: u32) -> u32 {
+        let span = (levels - 1) as f32;
+        (f32::from(component) * span / 255.0).round() as u32
     }
 }
