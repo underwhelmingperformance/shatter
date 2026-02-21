@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use shatter_macros::progress;
@@ -512,15 +513,13 @@ fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionE
             }
         })?;
 
-    let from_width = u16::try_from(from_image.width()).expect("image width fits u16");
-    let from_height = u16::try_from(from_image.height()).expect("image height fits u16");
-    let to_width = u16::try_from(to_image.width()).expect("image width fits u16");
-    let to_height = u16::try_from(to_image.height()).expect("image height fits u16");
+    let from_width = try_image_dimension_u16(request.from_path(), "width", from_image.width())?;
+    let from_height = try_image_dimension_u16(request.from_path(), "height", from_image.height())?;
+    let to_width = try_image_dimension_u16(request.to_path(), "width", to_image.width())?;
+    let to_height = try_image_dimension_u16(request.to_path(), "height", to_image.height())?;
 
-    let from_dimensions = PanelDimensions::new(from_width, from_height)
-        .expect("decoded image has non-zero dimensions");
-    let to_dimensions = PanelDimensions::new(to_width, to_height)
-        .expect("decoded image has non-zero dimensions");
+    let from_dimensions = try_panel_dimensions(request.from_path(), from_width, from_height)?;
+    let to_dimensions = try_panel_dimensions(request.to_path(), to_width, to_height)?;
     let dimensions = request.size().resolve(from_dimensions, to_dimensions);
 
     let from_pixels = from_image.into_raw();
@@ -534,6 +533,31 @@ fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionE
         to_width,
         to_height,
         dimensions,
+    })
+}
+
+fn try_image_dimension_u16(
+    path: &Path,
+    axis: &'static str,
+    value: u32,
+) -> Result<u16, TransitionError> {
+    u16::try_from(value).map_err(|_source| TransitionError::InputImageDimensionTooLarge {
+        path: path.to_path_buf(),
+        axis,
+        actual: value,
+        max: u32::from(u16::MAX),
+    })
+}
+
+fn try_panel_dimensions(
+    path: &Path,
+    width: u16,
+    height: u16,
+) -> Result<PanelDimensions, TransitionError> {
+    PanelDimensions::new(width, height).ok_or(TransitionError::InvalidImageDimensions {
+        path: path.to_path_buf(),
+        width: u32::from(width),
+        height: u32::from(height),
     })
 }
 
