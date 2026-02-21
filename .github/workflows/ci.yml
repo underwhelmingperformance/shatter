@@ -35,16 +35,14 @@ jobs:
           sudo apt-get install -y mesa-vulkan-drivers
 
       - name: Rebuild demo GIF
-        run: cargo run -- images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --size 1024x1024
-
-      - name: Check for GIF changes
-        id: gif-diff
         run: |
-          if git diff --quiet ramenbeer.gif; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
+          old_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
+          cargo run -- images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --size 1024x1024
+          new_hash=$(sha256sum ramenbeer.gif | cut -d' ' -f1)
+          if [ "$old_hash" != "$new_hash" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+        id: gif-diff
 
       - name: Fail if GIF is outdated on main
         if: steps.gif-diff.outputs.changed == 'true' && github.ref == 'refs/heads/main'
