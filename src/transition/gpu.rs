@@ -499,23 +499,31 @@ fn build_palette() -> Vec<u8> {
     palette
 }
 
-fn load_image(path: &Path) -> Result<image::RgbaImage, ImagePreparationError> {
+fn load_image(
+    path: &Path,
+    fit_to: Option<PanelDimensions>,
+) -> Result<image::RgbaImage, ImagePreparationError> {
     let bytes = std::fs::read(path).map_err(ImagePreparationError::Read)?;
     if is_svg(path, &bytes) {
-        decode_svg(&bytes)
+        decode_svg(&bytes, fit_to)
     } else {
         decode_raster(&bytes)
     }
 }
 
 fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionError> {
-    let from_image =
-        load_image(request.from_path()).map_err(|source| TransitionError::SourceImage {
+    let fit_to = match request.size() {
+        crate::RenderSize::Fixed(dimensions) => Some(dimensions),
+        crate::RenderSize::Auto => None,
+    };
+
+    let from_image = load_image(request.from_path(), fit_to)
+        .map_err(|source| TransitionError::SourceImage {
             path: request.from_path().to_path_buf(),
             source,
         })?;
     let to_image =
-        load_image(request.to_path()).map_err(|source| TransitionError::SourceImage {
+        load_image(request.to_path(), fit_to).map_err(|source| TransitionError::SourceImage {
             path: request.to_path().to_path_buf(),
             source,
         })?;
