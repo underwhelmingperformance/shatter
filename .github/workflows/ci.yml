@@ -29,16 +29,16 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Install GPU drivers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+
       - name: Checkout PR branch
         if: github.event_name == 'pull_request'
         run: |
           git fetch --depth=1 origin ${{ github.head_ref }}
           git checkout ${{ github.head_ref }}
-
-      - name: Install GPU drivers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers
 
       - name: Rebuild demo GIF
         id: gif-diff
