@@ -6,118 +6,6 @@ use image::DynamicImage;
 use resvg::{tiny_skia, usvg};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum InputKind {
-    Raster(image::ImageFormat),
-    Svg,
-}
-
-impl InputKind {
-    fn detect(path: &Path, source_bytes: &[u8]) -> Result<Self, ImagePreparationError> {
-        if has_svg_extension(path) || looks_like_svg(source_bytes) {
-            return Ok(Self::Svg);
-        }
-
-        let source_format =
-            image::guess_format(source_bytes).map_err(ImagePreparationError::UnknownFormat)?;
-        Ok(Self::Raster(source_format))
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Raster(_) => "raster",
-            Self::Svg => "svg",
-        }
-    }
-}
-
-#[derive(Debug)]
-struct ImageSource<'a> {
-    bytes: &'a [u8],
-    kind: InputKind,
-}
-
-impl<'a> ImageSource<'a> {
-    fn from_parts(path: &'a Path, bytes: &'a [u8]) -> Result<Self, ImagePreparationError> {
-        Ok(Self {
-            bytes,
-            kind: InputKind::detect(path, bytes)?,
-        })
-    }
-
-    const fn kind(&self) -> InputKind {
-        self.kind
-    }
-
-    const fn bytes(&self) -> &[u8] {
-        self.bytes
-    }
-}
-
-trait ImageDecodeBackend {
-    fn decode(&self, source: &ImageSource<'_>) -> Result<image::RgbaImage, ImagePreparationError>;
-}
-
-#[derive(Debug, Default)]
-struct RasterImageDecodeBackend;
-
-impl ImageDecodeBackend for RasterImageDecodeBackend {
-    fn decode(&self, source: &ImageSource<'_>) -> Result<image::RgbaImage, ImagePreparationError> {
-        let source_format = match source.kind() {
-            InputKind::Raster(source_format) => source_format,
-            other => {
-                return Err(ImagePreparationError::BackendRouting {
-                    expected: "raster",
-                    actual: other.as_str(),
-                });
-            }
-        };
-
-        let decoded = image::load_from_memory_with_format(source.bytes(), source_format)
-            .map_err(ImagePreparationError::Decode)?;
-        let oriented = apply_orientation(decoded, exif_orientation(source.bytes()));
-        Ok(oriented.to_rgba8())
-    }
-}
-
-#[derive(Debug, Default)]
-struct SvgImageDecodeBackend;
-
-impl ImageDecodeBackend for SvgImageDecodeBackend {
-    fn decode(&self, source: &ImageSource<'_>) -> Result<image::RgbaImage, ImagePreparationError> {
-        if !matches!(source.kind(), InputKind::Svg) {
-            return Err(ImagePreparationError::BackendRouting {
-                expected: "svg",
-                actual: source.kind().as_str(),
-            });
-        }
-
-        let options = usvg::Options::default();
-        let tree = usvg::Tree::from_data(source.bytes(), &options)
-            .map_err(ImagePreparationError::SvgParse)?;
-        let target_size = tree.size().to_int_size();
-        let width = target_size.width();
-        let height = target_size.height();
-
-        let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or({
-            ImagePreparationError::SvgRasterise {
-                width,
-                height,
-                reason: "failed to allocate SVG raster surface",
-            }
-        })?;
-        let mut pixmap_mut = pixmap.as_mut();
-        resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap_mut);
-
-        let rgba = pixmap.take_demultiplied();
-        image::RgbaImage::from_raw(width, height, rgba).ok_or(ImagePreparationError::SvgRasterise {
-            width,
-            height,
-            reason: "SVG raster output has an unexpected pixel buffer size",
-        })
-    }
-}
-
 /// Errors returned while decoding and normalising input images.
 #[derive(Debug, Error)]
 pub enum ImagePreparationError {
@@ -130,57 +18,62 @@ pub enum ImagePreparationError {
     /// The source image failed to decode.
     #[error("failed to decode source image")]
     Decode(#[source] image::ImageError),
-    /// Backend routing received an unexpected source format.
-    #[error("failed to route image decode backend: expected {expected}, got {actual}")]
-    BackendRouting {
-        /// Decoder backend expected input kind.
-        expected: &'static str,
-        /// Actual input kind.
-        actual: &'static str,
-    },
     /// SVG parsing failed.
     #[error("failed to parse SVG source")]
     SvgParse(#[source] usvg::Error),
-    /// SVG rasterisation failed.
-    #[error("failed to rasterise SVG source ({width}x{height}): {reason}")]
-    SvgRasterise {
+    /// SVG raster surface allocation failed.
+    #[error("failed to allocate SVG raster surface ({width}x{height})")]
+    SvgPixmapAlloc {
         /// Raster target width.
         width: u32,
         /// Raster target height.
         height: u32,
-        /// Failure reason.
-        reason: &'static str,
+    },
+    /// SVG raster output buffer does not match the expected image dimensions.
+    #[error("SVG raster buffer size mismatch ({width}x{height})")]
+    SvgBufferMismatch {
+        /// Expected image width.
+        width: u32,
+        /// Expected image height.
+        height: u32,
     },
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct ImagePreprocessor {
-    raster_backend: RasterImageDecodeBackend,
-    svg_backend: SvgImageDecodeBackend,
+/// Returns `true` when `path` has an SVG extension or `bytes` look like SVG
+/// markup.
+pub(crate) fn is_svg(path: &Path, bytes: &[u8]) -> bool {
+    has_svg_extension(path) || looks_like_svg(bytes)
 }
 
-impl ImagePreprocessor {
-    pub(crate) fn decode_oriented_from_path(
-        path: &Path,
-    ) -> Result<image::RgbaImage, ImagePreparationError> {
-        Self::default().decode_from_path(path)
-    }
+/// Decodes a raster image from raw bytes, applying EXIF orientation.
+pub(crate) fn decode_raster(bytes: &[u8]) -> Result<image::RgbaImage, ImagePreparationError> {
+    let format = image::guess_format(bytes).map_err(ImagePreparationError::UnknownFormat)?;
+    let decoded = image::load_from_memory_with_format(bytes, format)
+        .map_err(ImagePreparationError::Decode)?;
+    let oriented = apply_orientation(decoded, exif_orientation(bytes));
+    Ok(oriented.to_rgba8())
+}
 
-    fn decode_from_path(&self, path: &Path) -> Result<image::RgbaImage, ImagePreparationError> {
-        let source_bytes = std::fs::read(path).map_err(ImagePreparationError::Read)?;
-        let source = ImageSource::from_parts(path, &source_bytes)?;
-        self.decode_source(&source)
-    }
+/// Decodes an SVG image from raw bytes.
+pub(crate) fn decode_svg(bytes: &[u8]) -> Result<image::RgbaImage, ImagePreparationError> {
+    let options = usvg::Options::default();
+    let tree =
+        usvg::Tree::from_data(bytes, &options).map_err(ImagePreparationError::SvgParse)?;
+    let int_size = tree.size().to_int_size();
+    let width = int_size.width();
+    let height = int_size.height();
 
-    fn decode_source(
-        &self,
-        source: &ImageSource<'_>,
-    ) -> Result<image::RgbaImage, ImagePreparationError> {
-        match source.kind() {
-            InputKind::Raster(_) => self.raster_backend.decode(source),
-            InputKind::Svg => self.svg_backend.decode(source),
-        }
-    }
+    let mut pixmap =
+        tiny_skia::Pixmap::new(width, height).ok_or(ImagePreparationError::SvgPixmapAlloc {
+            width,
+            height,
+        })?;
+    let mut pixmap_mut = pixmap.as_mut();
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap_mut);
+
+    let rgba = pixmap.take_demultiplied();
+    image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or(ImagePreparationError::SvgBufferMismatch { width, height })
 }
 
 fn has_svg_extension(path: &Path) -> bool {
@@ -228,17 +121,30 @@ fn exif_orientation(source_bytes: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use assert_matches::assert_matches;
     use image::ImageEncoder;
     use pretty_assertions::assert_eq;
+    use svg::Document;
+    use svg::node::element::Rectangle;
 
     use super::*;
 
+    fn svg_filled_rect(width: u32, height: u32, fill: &str) -> String {
+        Document::new()
+            .set("xmlns", "http://www.w3.org/2000/svg")
+            .set("width", width)
+            .set("height", height)
+            .add(
+                Rectangle::new()
+                    .set("width", width)
+                    .set("height", height)
+                    .set("fill", fill),
+            )
+            .to_string()
+    }
+
     #[test]
-    fn decode_oriented_from_bytes_preserves_dimensions_when_no_exif_rotation()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn decode_raster_preserves_dimensions() -> Result<(), Box<dyn std::error::Error>> {
         let mut png_bytes = Vec::new();
         let source = image::RgbaImage::from_pixel(3, 2, image::Rgba([0xAA, 0xBB, 0xCC, 0xFF]));
         image::codecs::png::PngEncoder::new(&mut png_bytes).write_image(
@@ -247,10 +153,8 @@ mod tests {
             2,
             image::ExtendedColorType::Rgba8,
         )?;
-        let image_source = ImageSource::from_parts(Path::new("test.png"), &png_bytes)?;
-        let preprocessor = ImagePreprocessor::default();
 
-        let decoded = preprocessor.decode_source(&image_source)?;
+        let decoded = decode_raster(&png_bytes)?;
 
         assert_eq!(3, decoded.width());
         assert_eq!(2, decoded.height());
@@ -258,23 +162,17 @@ mod tests {
     }
 
     #[test]
-    fn detects_svg_sources_from_extension_or_markup() -> Result<(), Box<dyn std::error::Error>> {
-        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"></svg>"#;
-        let source_by_extension = ImageSource::from_parts(Path::new("icon.svg"), svg)?;
-        let source_by_markup = ImageSource::from_parts(Path::new("icon"), svg)?;
+    fn detects_svg_from_markup() {
+        let svg = svg_filled_rect(1, 1, "black");
 
-        assert_eq!(InputKind::Svg, source_by_extension.kind());
-        assert_eq!(InputKind::Svg, source_by_markup.kind());
-        Ok(())
+        assert!(looks_like_svg(svg.as_bytes()));
     }
 
     #[test]
-    fn rasterises_svg_sources() -> Result<(), Box<dyn std::error::Error>> {
-        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"><rect width="3" height="2" fill="#112233"/></svg>"##;
-        let source = ImageSource::from_parts(Path::new("panel.svg"), svg)?;
-        let preprocessor = ImagePreprocessor::default();
+    fn rasterises_svg() -> Result<(), Box<dyn std::error::Error>> {
+        let svg = svg_filled_rect(3, 2, "#112233");
 
-        let decoded = preprocessor.decode_source(&source)?;
+        let decoded = decode_svg(svg.as_bytes())?;
 
         assert_eq!(3, decoded.width());
         assert_eq!(2, decoded.height());
@@ -286,10 +184,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_binary_sources_report_unknown_format() {
+    fn unknown_bytes_report_unknown_format() {
         let bytes = [0x00, 0x01, 0x02, 0x03];
-        let result = ImageSource::from_parts(Path::new("blob.bin"), &bytes);
 
-        assert_matches!(result, Err(ImagePreparationError::UnknownFormat(_)));
+        assert_matches!(decode_raster(&bytes), Err(ImagePreparationError::UnknownFormat(_)));
     }
 }
