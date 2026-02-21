@@ -15,9 +15,13 @@ jobs:
   build-and-test:
     name: Build and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
 
@@ -26,3 +30,35 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
+
+      - name: Install GPU drivers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+
+      - name: Rebuild demo GIF
+        run: cargo run -- images/emoji_u1f35c.svg images/emoji_u1f37a.svg ramenbeer.gif --fps 60 --size 1024x1024
+
+      - name: Check for GIF changes
+        id: gif-diff
+        run: |
+          if git diff --quiet ramenbeer.gif; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail if GIF is outdated on main
+        if: steps.gif-diff.outputs.changed == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          echo "::error::ramenbeer.gif is out of date. Please update it in a pull request."
+          exit 1
+
+      - name: Commit and push updated GIF
+        if: steps.gif-diff.outputs.changed == 'true' && github.event_name == 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ramenbeer.gif
+          git commit -m "Rebuild demo GIF"
+          git push
