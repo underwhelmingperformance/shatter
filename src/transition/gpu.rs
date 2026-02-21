@@ -6,7 +6,7 @@ use shatter_macros::progress;
 use tracing::{info, warn};
 
 use crate::PanelDimensions;
-use crate::media::ImagePreprocessor;
+use crate::media::{ImagePreparationError, decode_raster, decode_svg, is_svg};
 
 use super::service::fps_to_delay_centiseconds;
 use super::{RenderReceipt, TransitionError, TransitionRequest};
@@ -499,18 +499,25 @@ fn build_palette() -> Vec<u8> {
     palette
 }
 
+fn load_image(path: &Path) -> Result<image::RgbaImage, ImagePreparationError> {
+    let bytes = std::fs::read(path).map_err(ImagePreparationError::Read)?;
+    if is_svg(path, &bytes) {
+        decode_svg(&bytes)
+    } else {
+        decode_raster(&bytes)
+    }
+}
+
 fn load_images(request: &TransitionRequest) -> Result<DecodedImages, TransitionError> {
-    let from_image = ImagePreprocessor::decode_oriented_from_path(request.from_path())
-        .map_err(|source| TransitionError::SourceImage {
+    let from_image =
+        load_image(request.from_path()).map_err(|source| TransitionError::SourceImage {
             path: request.from_path().to_path_buf(),
             source,
         })?;
     let to_image =
-        ImagePreprocessor::decode_oriented_from_path(request.to_path()).map_err(|source| {
-            TransitionError::SourceImage {
-                path: request.to_path().to_path_buf(),
-                source,
-            }
+        load_image(request.to_path()).map_err(|source| TransitionError::SourceImage {
+            path: request.to_path().to_path_buf(),
+            source,
         })?;
 
     let from_width = try_image_dimension_u16(request.from_path(), "width", from_image.width())?;
