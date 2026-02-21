@@ -15,6 +15,31 @@ pub enum TransitionError {
         /// Underlying decode or transformation failure.
         source: ImagePreparationError,
     },
+    /// Input image dimensions exceed the renderer's internal coordinate range.
+    #[error(
+        "input image `{path}` {axis} {actual} exceeds supported limit of {max}; \
+         use --size to downscale"
+    )]
+    InputImageDimensionTooLarge {
+        /// Input image path.
+        path: PathBuf,
+        /// Offending dimension axis.
+        axis: &'static str,
+        /// Observed dimension value.
+        actual: u32,
+        /// Supported maximum for this dimension.
+        max: u32,
+    },
+    /// Input image reports invalid zero dimensions.
+    #[error("input image `{path}` has invalid zero dimensions ({width}x{height})")]
+    InvalidImageDimensions {
+        /// Input image path.
+        path: PathBuf,
+        /// Decoded image width.
+        width: u32,
+        /// Decoded image height.
+        height: u32,
+    },
     /// No GPU adapter could be acquired.
     #[error("no GPU adapter available")]
     GpuUnavailable {
