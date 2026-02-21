@@ -11,43 +11,23 @@ struct Params {
     hold_frames: u32,
     seed_lo: u32,
     seed_hi: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    grid_x: u32,
+    grid_y: u32,
+    _pad: u32,
 };
 
 @group(0) @binding(0)
-var<storage, read> from_pixels: array<u32>;
+var from_tex: texture_2d<f32>;
 
 @group(0) @binding(1)
-var<storage, read> to_pixels: array<u32>;
+var to_tex: texture_2d<f32>;
 
 @group(0) @binding(2)
-var<storage, read_write> out_pixels: array<u32>;
-
-@group(0) @binding(3)
 var<uniform> params: Params;
 
-const GRID_X: f32 = 20.0;
-const GRID_Y: f32 = 20.0;
 const SMOOTHNESS: f32 = 0.25;
-
-fn unpack_rgba(pixel: u32) -> vec4<f32> {
-    let r = f32(pixel & 0xFFu) / 255.0;
-    let g = f32((pixel >> 8u) & 0xFFu) / 255.0;
-    let b = f32((pixel >> 16u) & 0xFFu) / 255.0;
-    let a = f32((pixel >> 24u) & 0xFFu) / 255.0;
-    return vec4<f32>(r, g, b, a);
-}
-
-fn pack_rgba(pixel: vec4<f32>) -> u32 {
-    let clamped = clamp(pixel, vec4<f32>(0.0), vec4<f32>(1.0));
-    let r = u32(round(clamped.r * 255.0));
-    let g = u32(round(clamped.g * 255.0));
-    let b = u32(round(clamped.b * 255.0));
-    let a = u32(round(clamped.a * 255.0));
-    return (a << 24u) | (b << 16u) | (g << 8u) | r;
-}
+const FOCAL: f32 = 2.0;
+const Z_MAX: f32 = 0.3;
 
 fn hash01_u32(x: u32, y: u32, seed_lo: u32, seed_hi: u32) -> f32 {
     var state = x * 374761393u + y * 668265263u + seed_lo * 982451653u + seed_hi * 2654435761u;
@@ -66,9 +46,15 @@ fn cell_progress(cell_noise: f32, phase_progress: f32) -> f32 {
     return smoothstep(edge0, edge1, phase_progress);
 }
 
-fn ease_out_quart(x: f32) -> f32 {
-    let t = 1.0 - x;
-    return 1.0 - t * t * t * t;
+// How far along `dir` from `pos` before pos + dir*t clears the viewport
+// boundary, expanded by `margin` on each side to account for perspective.
+fn exit_distance(pos: vec2<f32>, dir: vec2<f32>, margin: f32) -> f32 {
+    var t: f32 = 99.0;
+    if (dir.x > 0.001) { t = min(t, (1.0 + margin - pos.x) / dir.x); }
+    if (dir.x < -0.001) { t = min(t, (-margin - pos.x) / dir.x); }
+    if (dir.y > 0.001) { t = min(t, (1.0 + margin - pos.y) / dir.y); }
+    if (dir.y < -0.001) { t = min(t, (-margin - pos.y) / dir.y); }
+    return t;
 }
 
 fn timeline_progress(frame_index: u32) -> f32 {
@@ -96,11 +82,6 @@ fn timeline_progress(frame_index: u32) -> f32 {
     return f32(active_index) / f32(transition_frames - 1u);
 }
 
-// fit_sample_from and fit_sample_to are near-identical: both do
-// aspect-ratio-preserving sampling with letterbox/pillarbox centering.
-// WGSL lacks the ability to pass storage buffer references as function
-// parameters, so the duplication is unavoidable at the language level.
-
 fn fit_sample_from(uv: vec2<f32>) -> vec4<f32> {
     let out_w = f32(params.out_width);
     let out_h = f32(params.out_height);
@@ -125,8 +106,7 @@ fn fit_sample_from(uv: vec2<f32>) -> vec4<f32> {
 
     let sx = min(u32(floor(u * src_w)), params.from_width - 1u);
     let sy = min(u32(floor(v * src_h)), params.from_height - 1u);
-    let index = sy * params.from_width + sx;
-    return unpack_rgba(from_pixels[index]);
+    return textureLoad(from_tex, vec2<u32>(sx, sy), 0);
 }
 
 fn fit_sample_to(uv: vec2<f32>) -> vec4<f32> {
@@ -153,103 +133,117 @@ fn fit_sample_to(uv: vec2<f32>) -> vec4<f32> {
 
     let sx = min(u32(floor(u * src_w)), params.to_width - 1u);
     let sy = min(u32(floor(v * src_h)), params.to_height - 1u);
-    let index = sy * params.to_width + sx;
-    return unpack_rgba(to_pixels[index]);
+    return textureLoad(to_tex, vec2<u32>(sx, sy), 0);
 }
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x >= params.out_width || gid.y >= params.out_height || gid.z >= params.chunk_frames) {
-        return;
-    }
+// Per-cell animation properties derived from the grid position and seed.
+struct CellProps {
+    center: vec2<f32>,
+    exit_dir: vec2<f32>,
+    exit_dist: f32,
+    max_zoom: f32,
+    order: f32,
+};
 
-    let pixel_index = gid.y * params.out_width + gid.x;
-    let frame_index = params.frame_start + gid.z;
-
-    let progress = timeline_progress(frame_index);
-
-    let uv = vec2<f32>(
-        (f32(gid.x) + 0.5) / f32(params.out_width),
-        (f32(gid.y) + 0.5) / f32(params.out_height)
-    );
-
-    let cell = floor(vec2<f32>(GRID_X, GRID_Y) * uv);
-    let cx = u32(cell.x);
-    let cy = u32(cell.y);
-    let cell_center = (cell + 0.5) / vec2<f32>(GRID_X, GRID_Y);
+fn compute_cell_props(cx: u32, cy: u32) -> CellProps {
+    let grid = vec2<f32>(f32(params.grid_x), f32(params.grid_y));
+    let cell_center = (vec2<f32>(f32(cx), f32(cy)) + 0.5) / grid;
 
     let r_base  = hash01_u32(cx, cy, params.seed_lo, params.seed_hi);
     let r_angle = hash_channel(cx, cy, 1u, params.seed_lo, params.seed_hi);
     let r_speed = hash_channel(cx, cy, 3u, params.seed_lo, params.seed_hi);
 
-    // Forward speed: how fast this cell flies towards the camera.
-    let speed = 0.6 + r_speed * 0.8;
+    let radial = cell_center - vec2<f32>(0.5, 0.5);
+    let radial_dist = length(radial);
+    let radial_dir = radial / max(radial_dist, 0.001);
+    let jitter_angle = r_angle * 6.283185;
+    let jitter_dir = vec2<f32>(cos(jitter_angle), sin(jitter_angle));
+    let blend = smoothstep(0.0, 0.15, radial_dist);
+    let blended = mix(jitter_dir, radial_dir, blend);
+    let blended_len = length(blended);
+    let exit_dir = select(jitter_dir, blended / blended_len, blended_len > 0.001);
 
-    // Subtle lateral drift direction (random per cell).
-    let drift_angle = r_angle * 6.283185;
-    let drift_dir = vec2<f32>(cos(drift_angle), sin(drift_angle));
+    let max_zoom = 1.1 + r_speed * 0.15;
 
-    // Wave ordering: edges crack first, centre holds longest.
-    let centre_dist = length(cell_center - vec2<f32>(0.5, 0.5));
-    let centre_factor = clamp(centre_dist / 0.707, 0.0, 1.0);
+    let half_cell = 0.5 / grid;
+    let cell_extent = (abs(exit_dir.x) * half_cell.x + abs(exit_dir.y) * half_cell.y) * max_zoom;
+    let perspective_margin = 0.5 * Z_MAX / FOCAL;
+    let exit_dist = exit_distance(cell_center, exit_dir, perspective_margin) + cell_extent;
+
+    let centre_factor = clamp(radial_dist / 0.707, 0.0, 1.0);
     let order = 0.25 + r_base * 0.25 + (1.0 - centre_factor) * 0.25;
 
-    // Perspective vanishing point.
-    let vp = vec2<f32>(0.5, 0.5);
+    return CellProps(cell_center, exit_dir, exit_dist, max_zoom, order);
+}
 
-    let out_index = gid.z * (params.out_width * params.out_height) + pixel_index;
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) is_stage2: f32,
+};
 
-    // Stage one: explosion behind the image pushes cells towards the camera.
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vid: u32,
+    @builtin(instance_index) iid: u32,
+) -> VertexOutput {
+    let cx = iid % params.grid_x;
+    let cy = iid / params.grid_x;
+    let grid = vec2<f32>(f32(params.grid_x), f32(params.grid_y));
+
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 1.0),
+    );
+    let local = corners[vid];
+    let cell_uv = (vec2<f32>(f32(cx), f32(cy)) + local) / grid;
+
+    let props = compute_cell_props(cx, cy);
+    let progress = timeline_progress(params.frame_start);
+
+    var motion: f32;
+    var stage2: f32;
     if (progress < 0.5) {
         let phase = progress * 2.0;
-        let eased = ease_out_quart(phase);
-
-        let disappear = cell_progress(order, phase);
-
-        // Perspective scale: cell approaches camera along Z.
-        let z = eased * speed;
-        let scale = 1.0 / max(1.0 - z, 0.01);
-
-        // Lateral scatter applied after the perspective division so it stays
-        // visible even at high zoom (centre cells won't look static).
-        let drift = drift_dir * eased * speed * 0.15;
-
-        let sample_uv = clamp(
-            vp + (uv - vp) / scale - drift,
-            vec2<f32>(0.0), vec2<f32>(1.0)
-        );
-        let from_color = fit_sample_from(sample_uv);
-        let alpha = from_color.a * (1.0 - disappear) / scale;
-
-        if (alpha <= 0.0) {
-            out_pixels[out_index] = pack_rgba(vec4<f32>(0.0, 0.0, 0.0, 0.0));
-            return;
-        }
-        out_pixels[out_index] = pack_rgba(vec4<f32>(from_color.rgb, alpha));
-        return;
+        motion = cell_progress(props.order, phase);
+        stage2 = 0.0;
+    } else {
+        let phase = (progress - 0.5) * 2.0;
+        let order_in = 1.0 - props.order;
+        motion = 1.0 - cell_progress(order_in, phase);
+        stage2 = 1.0;
     }
 
-    // Stage two: target image assembles from scattered state.
-    let phase = (progress - 0.5) * 2.0;
-    let remaining = 1.0 - phase;
+    let zoom = 1.0 + motion * (props.max_zoom - 1.0);
+    let drift = props.exit_dir * motion * props.exit_dist;
+    let displaced = props.center + (cell_uv - props.center) * zoom + drift;
 
-    let appear = cell_progress(order, phase);
+    let z = motion * Z_MAX;
+    let scale = FOCAL / (FOCAL + z);
+    let screen = vec2<f32>(0.5) + (displaced - vec2<f32>(0.5)) * scale;
 
-    let z = remaining * speed;
-    let scale = 1.0 / max(1.0 - z, 0.01);
+    let ndc_x = screen.x * 2.0 - 1.0;
+    let ndc_y = 1.0 - screen.y * 2.0;
+    let instance_count = max(1.0, f32(params.grid_x) * f32(params.grid_y));
+    let depth = 0.5 - motion * 0.45 + f32(iid) / instance_count * 0.02;
 
-    let drift = drift_dir * remaining * speed * 0.15;
+    var out: VertexOutput;
+    out.position = vec4<f32>(ndc_x, ndc_y, depth, 1.0);
+    out.uv = cell_uv;
+    out.is_stage2 = stage2;
+    return out;
+}
 
-    let sample_uv = clamp(
-        vp + (uv - vp) / scale - drift,
-        vec2<f32>(0.0), vec2<f32>(1.0)
-    );
-    let to_color = fit_sample_to(sample_uv);
-    let alpha = to_color.a * appear / scale;
-
-    if (alpha <= 0.0) {
-        out_pixels[out_index] = pack_rgba(vec4<f32>(0.0, 0.0, 0.0, 0.0));
-        return;
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    var color: vec4<f32>;
+    if (in.is_stage2 < 0.5) {
+        color = fit_sample_from(in.uv);
+    } else {
+        color = fit_sample_to(in.uv);
     }
-    out_pixels[out_index] = pack_rgba(vec4<f32>(to_color.rgb, alpha));
+    if (color.a < 0.5) {
+        discard;
+    }
+    return color;
 }

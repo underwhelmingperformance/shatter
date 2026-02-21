@@ -3,6 +3,16 @@ use std::path::{Path, PathBuf};
 
 use crate::{PanelDimensions, RenderSize};
 
+/// Render parameters independent of the input/output file paths.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RenderParams {
+    pub size: RenderSize,
+    pub frame_count: NonZeroU16,
+    pub fps: NonZeroU16,
+    pub hold_frames: u16,
+    pub seed: u64,
+}
+
 /// Input parameters for a transition render operation.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct TransitionRequest {
@@ -17,22 +27,26 @@ pub struct TransitionRequest {
 }
 
 impl TransitionRequest {
-    /// Creates a transition request.
+    /// Creates a transition request from file paths and render parameters.
     ///
     /// ```
     /// use std::num::NonZeroU16;
     ///
-    /// use shatter::{PanelDimensions, RenderSize, TransitionRequest};
+    /// use shatter::{PanelDimensions, RenderParams, RenderSize, TransitionRequest};
     ///
     /// let request = TransitionRequest::new(
     ///     "from.png",
     ///     "to.png",
     ///     "out.gif",
-    ///     RenderSize::Fixed(PanelDimensions::new(64, 64).expect("64x64 should be valid")),
-    ///     NonZeroU16::new(24).expect("24 is non-zero"),
-    ///     NonZeroU16::new(16).expect("16 is non-zero"),
-    ///     2,
-    ///     42,
+    ///     RenderParams {
+    ///         size: RenderSize::Fixed(
+    ///             PanelDimensions::new(64, 64).expect("64x64 should be valid"),
+    ///         ),
+    ///         frame_count: NonZeroU16::new(24).expect("24 is non-zero"),
+    ///         fps: NonZeroU16::new(16).expect("16 is non-zero"),
+    ///         hold_frames: 2,
+    ///         seed: 42,
+    ///     },
     /// );
     /// assert_eq!(2, request.hold_frames());
     /// assert_eq!(42, request.seed());
@@ -42,21 +56,17 @@ impl TransitionRequest {
         from_path: impl Into<PathBuf>,
         to_path: impl Into<PathBuf>,
         output_path: impl Into<PathBuf>,
-        size: RenderSize,
-        frame_count: NonZeroU16,
-        fps: NonZeroU16,
-        hold_frames: u16,
-        seed: u64,
+        params: RenderParams,
     ) -> Self {
         Self {
             from_path: from_path.into(),
             to_path: to_path.into(),
             output_path: output_path.into(),
-            size,
-            frame_count,
-            fps,
-            hold_frames,
-            seed,
+            size: params.size,
+            frame_count: params.frame_count,
+            fps: params.fps,
+            hold_frames: params.hold_frames,
+            seed: params.seed,
         }
     }
 

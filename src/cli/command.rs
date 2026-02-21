@@ -140,16 +140,16 @@ impl Args {
             return Err(cmd.error(clap::error::ErrorKind::MissingRequiredArgument, message));
         }
 
-        Ok(Command::Render(RenderArgs::new(
-            self.from.expect("validated above"),
-            self.to.expect("validated above"),
-            self.output.expect("validated above"),
-            self.size,
-            self.duration_seconds,
-            self.fps,
-            self.hold_seconds,
-            self.seed,
-        )))
+        Ok(Command::Render(RenderArgs {
+            from: self.from.expect("validated above"),
+            to: self.to.expect("validated above"),
+            output: self.output.expect("validated above"),
+            size: self.size,
+            duration_seconds: self.duration_seconds,
+            fps: self.fps,
+            hold_seconds: self.hold_seconds,
+            seed: self.seed,
+        }))
     }
 }
 
