@@ -162,15 +162,16 @@ impl ShatterTransitionRenderer {
         request: &TransitionRequest,
     ) -> Result<RenderReceipt, TransitionError> {
         let images = load_images(request)?;
-        let mut output_file = std::fs::File::create(request.output_path()).map_err(|source| {
-            TransitionError::OutputIo {
-                path: request.output_path().to_path_buf(),
+        let output_path = request.output_path();
+        let temp_path = output_path.with_extension("gif.tmp");
+        let mut output_file =
+            std::fs::File::create(&temp_path).map_err(|source| TransitionError::OutputIo {
+                path: output_path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
         let frames_total = usize::from(request.frame_count().get());
         progress_set_length!(frames_total);
-        self.render_gif(
+        let result = self.render_gif(
             &images,
             &RenderGifOptions {
                 total_frames: request.frame_count().get(),
@@ -182,9 +183,18 @@ impl ShatterTransitionRenderer {
             &mut |n| {
                 progress_inc!(n);
             },
-        )?;
+        );
+        if let Err(err) = result {
+            warn!("Render failed, cleaning up temp file: {err}");
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
+        std::fs::rename(&temp_path, output_path).map_err(|source| TransitionError::OutputIo {
+            path: output_path.to_path_buf(),
+            source,
+        })?;
         Ok(RenderReceipt::new(
-            request.output_path().to_path_buf(),
+            output_path.to_path_buf(),
             images.dimensions,
             request.frame_count().get(),
             request.fps().get(),
