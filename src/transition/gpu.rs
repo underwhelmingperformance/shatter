@@ -13,10 +13,12 @@ use super::{RenderReceipt, TransitionError, TransitionRequest};
 
 const MAX_CHUNK_FRAMES: usize = 64;
 const QUANTIZE_WORKGROUP_SIZE: u32 = 256;
-/// Target pixel size for each grid cell. Preserves the original 20×20 grid
-/// for ~640×640 images and scales proportionally for other output sizes.
+/// Target pixel size for each grid cell in the proportional range.
 const SEGMENT_SIZE: u32 = 32;
-
+/// Below this threshold each pixel gets its own cell for a pixel-level shatter.
+const PIXEL_GRID_THRESHOLD: u32 = 128;
+/// Upper bound on cells per axis to keep instance counts reasonable.
+const MAX_GRID: u32 = 64;
 const VERTICES_PER_CELL: u32 = 6;
 
 // Uniform 6x7x6 RGB cube for GIF quantization.
@@ -1061,12 +1063,17 @@ fn map_staging_chunk(
     Ok(bytes)
 }
 
-/// Derives grid dimensions from the output image size so that each cell
-/// covers approximately [`SEGMENT_SIZE`] × [`SEGMENT_SIZE`] pixels.
+/// Derives grid dimensions from the output image size.
+///
+/// Images up to [`PIXEL_GRID_THRESHOLD`] per axis use one cell per pixel
+/// for a fine-grained shatter. Larger axes use [`SEGMENT_SIZE`]-pixel
+/// cells capped at [`MAX_GRID`].
 fn compute_grid(out_width: u16, out_height: u16) -> (u32, u32) {
-    let grid_x = (u32::from(out_width) / SEGMENT_SIZE).max(1);
-    let grid_y = (u32::from(out_height) / SEGMENT_SIZE).max(1);
-    (grid_x, grid_y)
+    let w = u32::from(out_width);
+    let h = u32::from(out_height);
+    let grid_x = if w <= PIXEL_GRID_THRESHOLD { w } else { (w / SEGMENT_SIZE).min(MAX_GRID) };
+    let grid_y = if h <= PIXEL_GRID_THRESHOLD { h } else { (h / SEGMENT_SIZE).min(MAX_GRID) };
+    (grid_x.max(1), grid_y.max(1))
 }
 
 fn align_to(value: u64, alignment: u64) -> u64 {
@@ -1095,15 +1102,27 @@ mod tests {
     const QUANTIZED_B_VALUES: [u8; B_LEVELS as usize] = [0, 51, 102, 153, 204, 255];
 
     #[test]
-    fn compute_grid_scales_with_output_size() {
+    fn compute_grid_uses_pixel_grid_below_threshold() {
+        // Every pixel is its own cell for small images.
+        assert_eq!((32, 32), compute_grid(32, 32));
+        assert_eq!((64, 48), compute_grid(64, 48));
+        assert_eq!((128, 128), compute_grid(128, 128));
+        // 1×1 edge case.
+        assert_eq!((1, 1), compute_grid(1, 1));
+    }
+
+    #[test]
+    fn compute_grid_uses_segment_size_above_threshold() {
         // 640×640 → 20×20 (matches the previous hardcoded default).
         assert_eq!((20, 20), compute_grid(640, 640));
-        // Small image clamps to 1×1.
-        assert_eq!((1, 1), compute_grid(16, 16));
         // Rectangular output produces a rectangular grid.
         assert_eq!((20, 15), compute_grid(640, 480));
-        // Large output scales up.
-        assert_eq!((60, 33), compute_grid(1920, 1080));
+    }
+
+    #[test]
+    fn compute_grid_caps_at_max_grid() {
+        // Very large output is capped.
+        assert_eq!((64, 64), compute_grid(4096, 4096));
     }
 
     #[test]
