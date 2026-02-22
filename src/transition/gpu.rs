@@ -13,8 +13,10 @@ use super::{RenderReceipt, TransitionError, TransitionRequest};
 
 const MAX_CHUNK_FRAMES: usize = 64;
 const QUANTIZE_WORKGROUP_SIZE: u32 = 256;
-const DEFAULT_GRID_X: u32 = 20;
-const DEFAULT_GRID_Y: u32 = 20;
+/// Target pixel size for each grid cell. Preserves the original 20×20 grid
+/// for ~640×640 images and scales proportionally for other output sizes.
+const SEGMENT_SIZE: u32 = 32;
+
 const VERTICES_PER_CELL: u32 = 6;
 
 // Uniform 6x7x6 RGB cube for GIF quantization.
@@ -228,8 +230,7 @@ impl ShatterTransitionRenderer {
             pixel_count,
         )?;
         let quantize_workgroups_x = (words_per_frame as u32).div_ceil(QUANTIZE_WORKGROUP_SIZE);
-        let grid_x = DEFAULT_GRID_X;
-        let grid_y = DEFAULT_GRID_Y;
+        let (grid_x, grid_y) = compute_grid(out_width, out_height);
         let instance_count = grid_x * grid_y;
 
         // Double-buffered dispatch loop: submit chunk N to
@@ -1060,6 +1061,14 @@ fn map_staging_chunk(
     Ok(bytes)
 }
 
+/// Derives grid dimensions from the output image size so that each cell
+/// covers approximately [`SEGMENT_SIZE`] × [`SEGMENT_SIZE`] pixels.
+fn compute_grid(out_width: u16, out_height: u16) -> (u32, u32) {
+    let grid_x = (u32::from(out_width) / SEGMENT_SIZE).max(1);
+    let grid_y = (u32::from(out_height) / SEGMENT_SIZE).max(1);
+    (grid_x, grid_y)
+}
+
 fn align_to(value: u64, alignment: u64) -> u64 {
     if alignment == 0 {
         return value;
@@ -1084,6 +1093,18 @@ mod tests {
     const QUANTIZED_R_VALUES: [u8; R_LEVELS as usize] = [0, 51, 102, 153, 204, 255];
     const QUANTIZED_G_VALUES: [u8; G_LEVELS as usize] = [0, 42, 85, 127, 170, 212, 255];
     const QUANTIZED_B_VALUES: [u8; B_LEVELS as usize] = [0, 51, 102, 153, 204, 255];
+
+    #[test]
+    fn compute_grid_scales_with_output_size() {
+        // 640×640 → 20×20 (matches the previous hardcoded default).
+        assert_eq!((20, 20), compute_grid(640, 640));
+        // Small image clamps to 1×1.
+        assert_eq!((1, 1), compute_grid(16, 16));
+        // Rectangular output produces a rectangular grid.
+        assert_eq!((20, 15), compute_grid(640, 480));
+        // Large output scales up.
+        assert_eq!((60, 33), compute_grid(1920, 1080));
+    }
 
     #[test]
     fn align_to_rounds_up() {
