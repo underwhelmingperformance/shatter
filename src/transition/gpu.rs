@@ -12,6 +12,11 @@ use super::service::fps_to_delay_centiseconds;
 use super::{RenderReceipt, TransitionError, TransitionRequest};
 
 const MAX_CHUNK_FRAMES: usize = 64;
+/// Target memory budget per chunk of frames.  `compute_chunk_frames` divides
+/// this by the per-frame index-buffer size so that larger images automatically
+/// get fewer frames per chunk while smaller images batch more aggressively.
+/// 16 MiB matches the old fixed cap of 64 at roughly 512×512 output.
+const TARGET_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const QUANTIZE_WORKGROUP_SIZE: u32 = 256;
 const DEFAULT_GRID_X: u32 = 20;
 const DEFAULT_GRID_Y: u32 = 20;
@@ -213,6 +218,13 @@ impl ShatterTransitionRenderer {
 
         let out_width = images.dimensions.width();
         let out_height = images.dimensions.height();
+
+        info!(
+            chunk_frames = buffers.chunk_frames,
+            total_frames = options.total_frames,
+            output = %format_args!("{}x{}", out_width, out_height),
+            "chunk size scaled to image dimensions"
+        );
         let total_frames = options.total_frames;
         let pixel_count = usize::from(out_width) * usize::from(out_height);
 
@@ -1011,13 +1023,19 @@ fn compute_chunk_frames(
         });
     }
 
+    // Scale frames-per-chunk with image size: divide the target memory
+    // budget by the per-frame index-buffer size so that larger images
+    // naturally get fewer frames per chunk.
+    let by_budget = (TARGET_CHUNK_BYTES / index_bytes_per_frame).max(1);
     let by_storage = usize::try_from(limits.max_storage_buffer_binding_size).unwrap_or(usize::MAX)
         / index_bytes_per_frame;
-    let capped = MAX_CHUNK_FRAMES.min(usize::from(total_frames));
-    let chunk_frames = capped.min(by_storage.max(1));
+    let chunk_frames = MAX_CHUNK_FRAMES
+        .min(usize::from(total_frames))
+        .min(by_budget)
+        .min(by_storage.max(1));
 
-    // `by_storage` is at least 1 (guarded by `.max(1)`) and `total_frames`
-    // is NonZeroU16, so `capped >= 1` and `chunk_frames >= 1`.
+    // Every operand is >= 1: MAX_CHUNK_FRAMES = 64, total_frames is
+    // NonZeroU16, by_budget >= 1, by_storage >= 1 (guarded by .max(1)).
     assert!(chunk_frames > 0, "chunk_frames is at least 1");
 
     Ok(chunk_frames)
@@ -1268,6 +1286,41 @@ mod tests {
             Err(TransitionError::WorkgroupLimitExceeded { required: actual_required, max })
                 if actual_required == required && max == max_workgroups
         );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_chunk_frames_scales_with_image_size() -> Result<(), Box<dyn std::error::Error>> {
+        let renderer = ShatterTransitionRenderer::new();
+        let ctx = match renderer.ensure_gpu_context() {
+            Ok(ctx) => ctx,
+            Err(TransitionError::GpuUnavailable { .. }) => return Ok(()),
+            Err(error) => return Err(Box::new(error)),
+        };
+
+        let total_frames: u16 = 60;
+
+        // Small image: 64x64 -> index_bytes_per_frame = 4096
+        let small_ibpf = (64usize * 64).div_ceil(4) * std::mem::size_of::<u32>();
+        let small_wg = ((64usize * 64).div_ceil(4) as u32).div_ceil(QUANTIZE_WORKGROUP_SIZE);
+        let small_chunks =
+            compute_chunk_frames(&ctx.device, total_frames, small_ibpf, small_wg)?;
+
+        // Large image: 2048x2048 -> index_bytes_per_frame = 4194304
+        let large_ibpf = (2048usize * 2048).div_ceil(4) * std::mem::size_of::<u32>();
+        let large_wg = ((2048usize * 2048).div_ceil(4) as u32).div_ceil(QUANTIZE_WORKGROUP_SIZE);
+        let large_chunks =
+            compute_chunk_frames(&ctx.device, total_frames, large_ibpf, large_wg)?;
+
+        // The larger image must get strictly fewer frames per chunk.
+        assert!(
+            large_chunks < small_chunks,
+            "expected large image ({large_chunks}) to get fewer frames per chunk \
+             than small image ({small_chunks})"
+        );
+        // Budget-based: 16 MiB / 4096 = 4096, capped to 60; large: 16 MiB / 4 MiB = 4
+        assert_eq!(small_chunks, usize::from(total_frames));
+        assert!(large_chunks <= 4);
         Ok(())
     }
 
