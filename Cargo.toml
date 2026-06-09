@@ -27,8 +27,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "jso
 wgpu = "26.0.1"
 
 [dev-dependencies]
-assert_matches = "1.5.0"
-pretty_assertions = "1.4.1"
-rstest = "0.26.1"
-svg = "0.18.0"
-tempfile = "3.25.0"
+assert_matches = "=1.5.0"
+pretty_assertions = "=1.4.1"
+rstest = "=0.26.1"
+svg = "=0.18.0"
+tempfile = "=3.25.0"
