@@ -14,7 +14,7 @@ kamadak-exif = "0.6.1"
 opentelemetry = "0.32.0"
 opentelemetry_sdk = "0.32.0"
 pollster = "0.4.0"
-resvg = "0.47.0"
+resvg = "0.48.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 shatter-macros = { version = "0.1.0", path = "shatter-macros" }
