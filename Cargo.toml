@@ -22,13 +22,13 @@ thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.44"
 tracing-indicatif = "0.3.14"
-tracing-opentelemetry = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt", "json"] }
 wgpu = "26.0.1"
 
 [dev-dependencies]
 assert_matches = "=1.5.0"
 pretty_assertions = "=1.4.1"
-rstest = "=0.27.0"
+rstest = "=0.28.0"
 svg = "=0.18.0"
 tempfile = "=3.27.0"
